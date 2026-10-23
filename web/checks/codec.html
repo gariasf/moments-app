@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>Codec check</title>
+		<link rel="icon" href="data:," />
+		<style>
+			video {
+				width: 320px;
+			}
+		</style>
+		<script>
+			// Results go to /results. An error the page doesn't catch, a syntax error included, ends the
+			// check with its message, in either engine, rather than leaving it to time out.
+			function post(body) {
+				const engine = new URLSearchParams(location.search).get("engine");
+				return fetch(`/results?engine=${engine}`, { method: "POST", body: JSON.stringify(body) });
+			}
+			addEventListener("error", (e) => post({ error: `the page threw ${e.message}` }));
+			addEventListener("unhandledrejection", (e) => post({ error: `the page threw ${e.reason}` }));
+		</script>
+	</head>
+	<body>
+		<p id="status"></p>
+		<div id="stage"></div>
+		<script type="module">
+			// Plays each clip in ?clips= muted, one at a time, and posts whether it decodes.
+			const PLAYING_S = 0.5; // on the clock, once playback starts
+			const COLOURS = 16; // in a testsrc2 frame; a flat or empty one has 1
+			const status = document.getElementById("status");
+			const stage = document.getElementById("stage");
+			const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+			async function until(done, ms) {
+				const end = performance.now() + ms;
+				while (!done() && performance.now() < end) await sleep(50);
+			}
+
+			// Distinct colours in the frame on screen, read back through a canvas at 64x36.
+			function colours(video) {
+				const canvas = document.createElement("canvas");
+				canvas.width = 64;
+				canvas.height = 36;
+				const context = canvas.getContext("2d", { willReadFrequently: true });
+				context.drawImage(video, 0, 0, canvas.width, canvas.height);
+				const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+				const seen = new Set();
+				for (let i = 0; i < pixels.length; i += 4) {
+					seen.add(`${pixels[i] >> 5},${pixels[i + 1] >> 5},${pixels[i + 2] >> 5}`);
+				}
+				return seen.size;
+			}
+
+			// What shows a clip decoded once its clock moves: a frame with real pixels for video; for
+			// audio, decoded bytes where the engine counts them (Chrome), else an audio track (WebKit).
+			async function evidence(video, file) {
+				const clock = `clock ${video.currentTime.toFixed(2)} s`;
+				if (video.currentTime < PLAYING_S) return { verdict: "fails", detail: `${clock}, stalled` };
+				if (file.endsWith(".mp4")) {
+					let count = 0;
+					await until(() => {
+						count = colours(video);
+						return count >= COLOURS;
+					}, 1000);
+					const frame = `${video.videoWidth}x${video.videoHeight}, ${count} colours`;
+					return { verdict: count >= COLOURS ? "plays" : "fails", detail: `${clock}, ${frame}` };
+				}
+				const [count, what] =
+					"webkitAudioDecodedByteCount" in video
+						? [video.webkitAudioDecodedByteCount, "audio bytes decoded"]
+						: [video.audioTracks.length, "audio tracks"];
+				return { verdict: count > 0 ? "plays" : "fails", detail: `${clock}, ${what}: ${count}` };
+			}
+
+			async function play(file) {
+				status.textContent = `Playing ${file}, muted`;
+				const video = document.createElement("video");
+				video.muted = true;
+				video.src = `media/${file}`;
+				stage.replaceChildren(video);
+				let refused = "";
+				video.play().catch((e) => {
+					refused = `${e.name}: ${e.message}`;
+				});
+				await until(() => video.error || refused || video.currentTime >= PLAYING_S, 8000);
+				const error = video.error ? `MediaError ${video.error.code}: ${video.error.message}` : refused;
+				const result = error ? { verdict: "fails", detail: error } : await evidence(video, file);
+				video.removeAttribute("src");
+				video.load(); // frees the decoder for the next clip
+				return { file, ...result };
+			}
+
+			const results = [];
+			for (const file of new URLSearchParams(location.search).get("clips").split(",")) {
+				results.push(await play(file));
+			}
+			status.textContent = "Done";
+			await post({ results });
+		</script>
+	</body>
+</html>

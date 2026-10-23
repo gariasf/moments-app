@@ -1,0 +1,28 @@
+name: Release
+
+# A version tag such as v0.1.0 publishes the image as ghcr.io/gariasf/moments:0.1.0.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build image and push it to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image=ghcr.io/gariasf/moments:${GITHUB_REF_NAME#v}
+          docker build --platform linux/amd64 -t "$image" .
+          echo "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push --quiet "$image"
+          # The digest the store's compose file pins.
+          echo "$image@$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')" | tee -a "$GITHUB_STEP_SUMMARY"

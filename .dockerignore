@@ -1,0 +1,7 @@
+# The image builds from these alone; web/node_modules and web/dist are made inside it.
+*
+!go.mod
+!*.go
+!web
+web/node_modules
+web/dist

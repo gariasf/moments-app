@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    # The server's tests run against the image's FFmpeg: Debian's, at the version every flag was verified on.
+    # The Dockerfile's test and last stages and web/checks/codec.mjs use the same Debian and FFmpeg; bump them all together.
+    container: debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+    steps:
+      - name: Install FFmpeg
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get update -qq && apt-get install -qq -y --no-install-recommends ffmpeg=7:7.1.5-0+deb13u1 >/dev/null
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.16.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install UI dependencies
+        working-directory: web
+        run: npm ci --no-fund --no-audit
+      - name: Biome
+        working-directory: web
+        run: npm run lint
+      - name: Type check
+        working-directory: web
+        run: npm run typecheck
+      - name: UI tests
+        working-directory: web
+        run: npm test
+      - name: Build UI
+        working-directory: web
+        run: npm run build
+      # The binary embeds web/dist, so Go builds after the UI.
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go test
+        run: go test ./...
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The build's log runs to hundreds of lines, so it shows only when the build fails.
+      - name: Build image
+        run: docker build --platform linux/amd64 -t moments . >"$RUNNER_TEMP/build.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/build.log"; exit 1; }
+      # Mounted as the store's package mounts them: Home read-only, with MeTube's
+      # folder and the Moments folder writable on top, and app data. All of it is
+      # owned by 1000, as on the Umbrel, so only the mount can make Home read-only.
+      - name: Start image with the package's mounts
+        run: |
+          home=$RUNNER_TEMP/home data=$RUNNER_TEMP/data
+          mkdir -p "$home/Downloads/metube" "$home/Moments" "$data"
+          sudo chown -R 1000:1000 "$home" "$data"
+          docker run --detach --name moments --publish 8080:8080 --env MOMENTS_HOME=/home --env MOMENTS_DATA=/data \
+            --volume "$home:/home:ro" \
+            --volume "$home/Downloads/metube:/home/Downloads/metube" \
+            --volume "$home/Moments:/home/Moments" \
+            --volume "$data:/data" \
+            moments
+      - name: Check UI and mounts
+        run: |
+          curl --fail --silent --retry 10 --retry-all-errors --retry-delay 1 http://localhost:8080/ | grep --quiet '<div id="root"></div>'
+          mounts=$(curl --fail --silent http://localhost:8080/api/mounts)
+          echo "$mounts"
+          test "$mounts" = '[{"path":"","access":"read-only","want":"read-only"},{"path":"Downloads/metube","access":"writable","want":"writable"},{"path":"Moments","access":"writable","want":"writable"}]'
+      - name: Server log
+        if: always()
+        run: docker logs moments

@@ -1,0 +1,3 @@
+# The Moments folder is the Library
+
+The Library has no database: it is the MP4 files at the top level of the Moments folder in Home. Each file carries its own data: its name is the title, and its metadata holds the creation date and where it came from (the Source's name and path, the start and end in the Source's time, the audio track). Everything else, such as posters, is a cache the app rebuilds. Renames and deletions in Files need no reconciling, and uninstalling loses nothing. The cost is that titles must be valid, unique file names, and data edited after a save, such as tags, will need its own home when it arrives, since changing a Moment's metadata rewrites the file.

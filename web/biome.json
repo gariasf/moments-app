@@ -1,0 +1,14 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+	"files": {
+		"includes": ["**", "!dist", "!src/shadcn.css"]
+	},
+	"css": {
+		"parser": { "tailwindDirectives": true }
+	},
+	"linter": {
+		"rules": {
+			"preset": "recommended"
+		}
+	}
+}

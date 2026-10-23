@@ -1,0 +1,11 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.playwright-mcp/
+/moments
+web/node_modules/
+web/dist/

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>Trimmer check</title>
+		<link rel="icon" href="data:," />
+		<style>
+			video {
+				width: 320px;
+			}
+		</style>
+		<script>
+			// Results go to /results. An error the page doesn't catch, a syntax error included, ends the
+			// check with its message, in either engine, rather than leaving it to time out.
+			function post(body) {
+				const engine = new URLSearchParams(location.search).get("engine");
+				return fetch(`/results?engine=${engine}`, { method: "POST", body: JSON.stringify(body) });
+			}
+			addEventListener("error", (e) => post({ error: `the page threw ${e.message}` }));
+			addEventListener("unhandledrejection", (e) => post({ error: `the page threw ${e.reason}` }));
+		</script>
+	</head>
+	<body>
+		<p id="status"></p>
+		<div id="stage"></div>
+		<script type="module">
+			// Opens each Source in ?sources= with the Trimmer's player, muted, one at a time. It posts
+			// the time of every frame shown in the first ?seconds= of the Source, and how long the first
+			// took to show after opening. Then, paused, the first frame each of the Source's seeks shows
+			// (a step, a time, or two times at once), how long it took, how many streams it started, and
+			// whether its time was outside the buffer when sought; the speed of ?play= seconds of
+			// playing at ?rate= from the last seek, and how often it stalled, waiting for the stream; and
+			// each frame the Source's loop shows over ?passes= passes, with when it showed.
+			import { playSource } from "/src/player.ts";
+
+			// Counts the player's streams, which only a seek outside the buffer starts.
+			let streams = 0;
+			const { fetch } = window;
+			window.fetch = (url, ...rest) => {
+				if (String(url).startsWith("/api/source/stream")) streams++;
+				return fetch(url, ...rest);
+			};
+
+			const params = new URLSearchParams(location.search);
+			const seconds = Number(params.get("seconds"));
+			const status = document.getElementById("status");
+			const stage = document.getElementById("stage");
+			const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+			async function watch({ path, seeks, loop }) {
+				status.textContent = `Playing ${path}, muted`;
+				const video = document.createElement("video");
+				video.muted = true;
+				video.playsInline = true;
+				stage.replaceChildren(video);
+				let problem;
+				let shown = []; // [time, when it showed] of each frame shown since it was last emptied
+				const until = async (done, ms) => {
+					const end = performance.now() + ms;
+					while (!done() && !problem && performance.now() < end) await sleep(20);
+				};
+				// Whether the buffer holds time, which a seek there plays without a new stream (#24).
+				const held = (time) => {
+					for (let i = 0; i < video.buffered.length; i++)
+						if (video.buffered.start(i) <= time && time < video.buffered.end(i)) return true;
+					return false;
+				};
+				const opened = performance.now();
+				const playback = playSource(
+					video,
+					path,
+					(message) => {
+						problem = message;
+					},
+					// The player's frame clock: each frame's own time, as it shows.
+					(time) => shown.push([time, performance.now()]),
+				);
+				await until(() => shown.length && shown.at(-1)[0] >= shown[0][0] + seconds, (seconds + 10) * 1000);
+				const played = shown;
+				const result = { path, firstFrameMs: played[0]?.[1] - opened, frames: played.map(([time]) => time) };
+
+				video.pause();
+				await sleep(300); // for frames already on their way
+				result.seeks = [];
+				for (const { seek, step } of seeks) {
+					if (problem) break;
+					shown = [];
+					const [asked, before] = [performance.now(), streams];
+					const outside = !step && [seek].flat().some((time) => !held(time));
+					if (step) playback.step(step);
+					else for (const time of [seek].flat()) playback.seek(time);
+					await until(() => shown.length, 5000);
+					const [frame, at] = shown[0] ?? [];
+					result.seeks.push({ frame, ms: at - asked, streams: streams - before, outside });
+				}
+
+				// A stall is a wait once playing has begun: the last seek's stream may still be filling.
+				shown = [];
+				result.stalls = 0;
+				const stalled = () => {
+					if (shown.length) result.stalls++;
+				};
+				video.addEventListener("waiting", stalled);
+				video.playbackRate = Number(params.get("rate"));
+				video.play().catch(() => {});
+				await sleep(Number(params.get("play")) * 1000);
+				video.pause();
+				video.removeEventListener("waiting", stalled);
+				const [[first, from] = [], [last, to] = []] = [shown[0], shown.at(-1)];
+				result.speed = (last - first) / ((to - from) / 1000);
+
+				// Then the loop, at 1×, from where the 2× stopped, which is before its start: every frame
+				// shown from the one its first seek shows, until ?passes= passes have gone back to the
+				// start, or a minute goes by.
+				await sleep(300); // for frames already on their way
+				shown = [];
+				video.playbackRate = 1;
+				playback.loop(loop.start, loop.end);
+				const passes = Number(params.get("passes"));
+				const starts = () => shown.filter(([time]) => Math.abs(time - loop.start) < 1e-3).length;
+				await until(() => starts() > passes, 60_000);
+				playback.loop();
+				video.pause();
+				result.loop = shown;
+				playback.stop();
+				return { ...result, problem };
+			}
+
+			const results = [];
+			for (const source of JSON.parse(params.get("sources"))) results.push(await watch(source));
+			status.textContent = "Done";
+			await post({ results });
+		</script>
+	</body>
+</html>
