@@ -392,20 +392,23 @@ func TestFramesAroundATimeAreWhereAMomentCanStartAndEnd(t *testing.T) {
 	// Source that starts 10 s in, as some remuxes do; B-frames, which show out
 	// of their decode order; x265's open GOP, whose keyframes have leading
 	// frames, decoded after them but shown before; no B-frames; video that
-	// starts 3 s after the audio; and an MP4 cut mid-GOP by a stream copy, whose
-	// edit list keeps its first keyframe from showing.
+	// starts 3 s after the audio; an MP4 cut mid-GOP by a stream copy, whose
+	// edit list keeps its first keyframe from showing; and VP9 and H.264 4:2:2
+	// with B-frames, which a Moment converts.
 	sources := map[string]struct {
 		args       []string
 		cut        float64 // where the copy starts, for a Source cut from another
 		start      float64 // where its video's time starts
 		everyFrame bool    // a clean end
 	}{
-		"Downloads/Movies/Late (2024)/Late.mkv": {args: []string{"-t", "25", "-c:v", "libx264", "-g", "240", "-keyint_min", "240", "-sc_threshold", "0", "-output_ts_offset", "10"}, start: 10},
-		"Downloads/Movies/Clip (2024)/Clip.mp4": {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "3", "-g", "48"}},
-		"Videos/Open GOP.mp4":                   {args: []string{"-t", "8", "-c:v", "libx265", "-x265-params", "log-level=error:keyint=48:min-keyint=48:scenecut=0:open-gop=1"}},
-		"Videos/No B-frames.mp4":                {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "0", "-g", "48"}, everyFrame: true},
-		"Videos/Audio first.mkv":                {args: []string{"-t", "8", "-c:v", "libx264", "-g", "48", "-vf", "setpts=PTS+3/TB"}, start: 3},
-		"Videos/Cut.mp4":                        {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "3", "-g", "48"}, cut: 0.5},
+		"Downloads/Movies/Late (2024)/Late.mkv":   {args: []string{"-t", "25", "-c:v", "libx264", "-g", "240", "-keyint_min", "240", "-sc_threshold", "0", "-output_ts_offset", "10"}, start: 10},
+		"Downloads/Movies/Clip (2024)/Clip.mp4":   {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "3", "-g", "48"}},
+		"Videos/Open GOP.mp4":                     {args: []string{"-t", "8", "-c:v", "libx265", "-x265-params", "log-level=error:keyint=48:min-keyint=48:scenecut=0:open-gop=1"}},
+		"Videos/No B-frames.mp4":                  {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "0", "-g", "48"}, everyFrame: true},
+		"Videos/Audio first.mkv":                  {args: []string{"-t", "8", "-c:v", "libx264", "-g", "48", "-vf", "setpts=PTS+3/TB"}, start: 3},
+		"Videos/Cut.mp4":                          {args: []string{"-t", "8", "-c:v", "libx264", "-bf", "3", "-g", "48"}, cut: 0.5},
+		"Downloads/metube/VP9 [aqz-KE-bpKQ].webm": {args: []string{"-t", "8", "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "48"}, everyFrame: true},
+		"Videos/4:2:2.mkv":                        {args: []string{"-t", "8", "-c:v", "libx264", "-pix_fmt", "yuv422p", "-bf", "3", "-g", "48"}, everyFrame: true},
 	}
 	for name, s := range sources {
 		path := filepath.Join(home, name)
@@ -430,20 +433,24 @@ func TestFramesAroundATimeAreWhereAMomentCanStartAndEnd(t *testing.T) {
 		}
 		// Before its start, its first frame, before its first keyframe that
 		// shows (in the cut), just before a keyframe (on x265's leading frames),
-		// on one, between keyframes, and past its end.
+		// on one, between keyframes, and past its end; through there, and
+		// through 2 s and 12 s past it, spans like those nudges ask for
+		// (web/src/marks.ts).
 		for _, at := range []float64{s.start - 5, s.start, s.start + 1.2, s.start + 3.9, s.start + 4, s.start + 5.5, s.start + 9.95, s.start + 15, s.start + 30} {
-			got := framesOf(t, srv, name, at)
-			// From the keyframe at or before at, or else the first, through at.
-			from := keyframes[0]
-			for _, k := range keyframes {
-				if k <= at {
-					from = k
+			for _, to := range []float64{at, at + 2, at + 12} {
+				got := framesOf(t, srv, name, at, to)
+				// From the keyframe at or before at, or else the first, through to.
+				from := keyframes[0]
+				for _, k := range keyframes {
+					if k <= at {
+						from = k
+					}
 				}
-			}
-			wantKeyframes, wantEnds := between(keyframes, from, max(from, at)), between(ends, from, at)
-			if !slices.Equal(got.Keyframes, wantKeyframes) || got.CleanEnds == nil || !slices.Equal(got.CleanEnds, wantEnds) {
-				t.Errorf("%s around %v s: keyframes at %s and clean ends at %s, want keyframes at %s and clean ends at %s",
-					name, at, brief(got.Keyframes), brief(got.CleanEnds), brief(wantKeyframes), brief(wantEnds))
+				wantKeyframes, wantEnds := between(keyframes, from, max(from, to)), between(ends, from, to)
+				if !slices.Equal(got.Keyframes, wantKeyframes) || got.CleanEnds == nil || !slices.Equal(got.CleanEnds, wantEnds) {
+					t.Errorf("%s from %v s through %v s: keyframes at %s and clean ends at %s, want keyframes at %s and clean ends at %s",
+						name, at, to, brief(got.Keyframes), brief(got.CleanEnds), brief(wantKeyframes), brief(wantEnds))
+				}
 			}
 		}
 	}
@@ -479,10 +486,14 @@ func thumbnailOf(t *testing.T, srv *httptest.Server, path string, at float64) []
 }
 
 // framesOf asks the server for the keyframes and clean ends of the Source at
-// path around the time at.
-func framesOf(t *testing.T, srv *httptest.Server, path string, at float64) (f struct{ Keyframes, CleanEnds []float64 }) {
+// path from the time at through to, leaving to out when it's at.
+func framesOf(t *testing.T, srv *httptest.Server, path string, at, to float64) (f struct{ Keyframes, CleanEnds []float64 }) {
 	t.Helper()
-	if err := json.Unmarshal([]byte(get(t, srv.URL+"/api/source/frames?"+url.Values{"path": {path}, "at": {fmt.Sprint(at)}}.Encode(), "application/json")), &f); err != nil {
+	q := url.Values{"path": {path}, "at": {fmt.Sprint(at)}}
+	if to != at {
+		q.Set("to", fmt.Sprint(to))
+	}
+	if err := json.Unmarshal([]byte(get(t, srv.URL+"/api/source/frames?"+q.Encode(), "application/json")), &f); err != nil {
 		t.Fatal(err)
 	}
 	return f
@@ -517,7 +528,7 @@ func shownFrame(t *testing.T, image []byte, file string) (time, difference float
 	if best < 0 {
 		t.Fatalf("psnr compared no frames of %s", file)
 	}
-	return packetTimes(t, file, "V")[best], least
+	return shownTimes(t, file)[best], least
 }
 
 // keyframeTimes reads the presentation times of the keyframes in file's

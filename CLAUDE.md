@@ -34,11 +34,14 @@ Planning lives on the wayfinder map issue
   which has no Node types.
 - `web/checks/`: browser checks on the Mac, outside CI, in the system
   WebKit and headless Chrome, both muted. `node web/checks/codec.mjs`
-  runs the codec check, and `node web/checks/trimmer.mjs <URL>` the
-  Trimmer check, through the host run at that URL.
+  runs the codec check, `node web/checks/trimmer.mjs <URL>` the
+  Trimmer check, and `node web/checks/moments.mjs <URL>` the Moments
+  check, through the host run at that URL.
 - `umbrel/host-run.sh start|stop`: this branch's server on the Umbrel
   host, against the real Home mounted read-only, at a localhost URL it
   prints. The test set's paths stay on the Umbrel, out of the repo.
+  `umbrel/host-run.sh iphone` adds the iPhone check (`umbrel/iphone/`)
+  to a started run: a page on the LAN, until `stop`.
 - `Dockerfile`: the image. A `v*` tag publishes it to GHCR
   (`.github/workflows/release.yml`), the `guillem-moments` package in
   Guillem's Apps pins its digest, and `./snapshot.sh <tag>` publishes the

@@ -21,7 +21,13 @@ type Mount = {
 
 // The folders in Home and the videos in them, or a search across all of Home.
 // Picking a video opens it with onOpen.
-export function SourceBrowser({ onOpen }: { onOpen: (video: Video) => void }) {
+export function SourceBrowser({
+	onOpen,
+	shown,
+}: {
+	onOpen: (video: Video) => void;
+	shown: boolean;
+}) {
 	const [path, setPath] = useState(""); // "" is Home
 	const [query, setQuery] = useState("");
 	// A listing keeps the search it answers, "" for a folder, so the list never
@@ -29,7 +35,23 @@ export function SourceBrowser({ onOpen }: { onOpen: (video: Video) => void }) {
 	const [listing, setListing] = useState<Listing & { q: string }>();
 	const [error, setError] = useState("");
 	const [mounts, setMounts] = useState<Mount[]>([]);
+	const [counts, setCounts] = useState(new Map<string, number>()); // by path
 	const q = query.trim();
+
+	useEffect(() => {
+		if (!shown) return;
+		const abort = new AbortController();
+		fetch("/api/moments", { signal: abort.signal })
+			.then((response) => response.json())
+			.then((library: { sourcePath?: string }[]) => {
+				const byPath = new Map<string, number>();
+				for (const { sourcePath = "" } of library)
+					byPath.set(sourcePath, (byPath.get(sourcePath) ?? 0) + 1);
+				setCounts(byPath);
+			})
+			.catch(() => {});
+		return () => abort.abort();
+	}, [shown]);
 
 	useEffect(() => {
 		fetch("/api/mounts")
@@ -142,6 +164,7 @@ export function SourceBrowser({ onOpen }: { onOpen: (video: Video) => void }) {
 										)}
 									</span>
 									<span className="shrink-0 text-muted-foreground tabular-nums">
+										{momentCount(counts.get(video.path))}
 										{formatSize(video.size)}
 									</span>
 								</Button>
@@ -168,6 +191,11 @@ export function SourceBrowser({ onOpen }: { onOpen: (video: Video) => void }) {
 			</p>
 		</div>
 	);
+}
+
+function momentCount(count = 0) {
+	if (!count) return "";
+	return `${count} ${count === 1 ? "Moment" : "Moments"} · `;
 }
 
 const units = ["byte", "kilobyte", "megabyte", "gigabyte", "terabyte"];

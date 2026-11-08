@@ -1,7 +1,7 @@
 // The browser-check harness (#16): opens a check page from this folder in the system WebKit and in
 // headless Chrome on the Mac, both muted, and returns what the page posts back to /results. It needs
 // no packages: a short Swift program drives WebKit, and Node's own WebSocket drives Chrome.
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import {
 	createReadStream,
@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { createServer } from "node:http";
 import { stripTypeScriptTypes } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -32,6 +32,23 @@ const running = new Set();
 process.on("exit", () => {
 	for (const engine of running) engine.kill();
 });
+
+// Runs command on the Umbrel with input on its stdin. Agents only read there, outside
+// /home/umbrel/moments-check and /tmp (docs/agents/workflow.md, The Umbrel).
+export function onUmbrel(command, input = "") {
+	return execFileSync(
+		"ssh",
+		[
+			"-o",
+			"BatchMode=yes",
+			"-i",
+			join(homedir(), ".ssh/umbrel_moments"),
+			"umbrel@umbrel.local",
+			command,
+		],
+		{ input, encoding: "utf8" },
+	);
+}
 
 /**
  * Opens `page`, a file in this folder with any query, in both engines at once. The files in

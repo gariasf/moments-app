@@ -9,7 +9,16 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
+
+// TestMain runs the server itself when a test starts it as its own process.
+func TestMain(m *testing.M) {
+	if os.Getenv("MOMENTS_TEST_SERVER") != "" {
+		main()
+	}
+	os.Exit(m.Run())
+}
 
 func TestServesUI(t *testing.T) {
 	srv := serve(t, t.TempDir())
@@ -57,8 +66,25 @@ func serve(t *testing.T, home string) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(newHandler(root, filepath.Join(home, "../data")))
+	handler, err := newHandler(root, filepath.Join(home, "../data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(handler)
 	t.Cleanup(func() {
+		// A Save still on its way, as a failed test leaves them, would write
+		// into the folders removed next.
+		for wait := time.Now().Add(time.Minute); time.Now().Before(wait); time.Sleep(20 * time.Millisecond) {
+			res, err := http.Get(srv.URL + "/api/saves")
+			if err != nil {
+				break
+			}
+			saves, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+			if !strings.Contains(string(saves), `"waiting"`) && !strings.Contains(string(saves), `"saving"`) {
+				break
+			}
+		}
 		srv.Close()
 		root.Close()
 	})

@@ -11,9 +11,7 @@
 // in a PR; a failure may print their paths, which stay out of the repo (#22).
 // usage: node web/checks/trimmer.mjs <the URL umbrel/host-run.sh start prints>
 import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { runPage } from "./harness.mjs";
+import { onUmbrel, runPage } from "./harness.mjs";
 
 const SECONDS = 10; // of each Source, from its start
 const FIRST_FRAME_MS = 1000; // after opening a timed Source (the stream's 1 s fragments)
@@ -32,23 +30,6 @@ if (!url) {
 		"usage: node web/checks/trimmer.mjs <the URL umbrel/host-run.sh start prints>",
 	);
 	process.exit(2);
-}
-
-// Runs command on the Umbrel with input on its stdin. Agents only read there, outside
-// /home/umbrel/moments-check and /tmp (docs/agents/workflow.md, The Umbrel).
-function onUmbrel(command, input = "") {
-	return execFileSync(
-		"ssh",
-		[
-			"-o",
-			"BatchMode=yes",
-			"-i",
-			join(homedir(), ".ssh/umbrel_moments"),
-			"umbrel@umbrel.local",
-			command,
-		],
-		{ input, encoding: "utf8" },
-	);
 }
 
 // This branch's host run, whose scratch folder holds the MeTube downloads it plays (host-run.sh).

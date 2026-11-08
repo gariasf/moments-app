@@ -79,6 +79,22 @@ jobs:
           mounts=$(curl --fail --silent http://localhost:8080/api/mounts)
           echo "$mounts"
           test "$mounts" = '[{"path":"","access":"read-only","want":"read-only"},{"path":"Downloads/metube","access":"writable","want":"writable"},{"path":"Moments","access":"writable","want":"writable"}]'
+      # A Save, as the Trimmer makes one, of a clip the image's FFmpeg makes in
+      # MeTube's folder, its AC-3 converted, without a GPU. Once the server lists
+      # no Save, the Moment is all the Moments folder holds.
+      - name: Make a Save
+        run: |
+          docker exec moments ffmpeg -nostdin -v error -f lavfi -i testsrc2=size=320x240:rate=24 -f lavfi -i sine \
+            -t 4 -c:v libx264 -c:a ac3 /home/Downloads/metube/Clip.mkv
+          curl --fail --silent --show-error --json '{"path":"Downloads/metube/Clip.mkv","start":0,"end":2,"title":"Clip"}' http://localhost:8080/api/saves
+          echo
+          for second in $(seq 30); do
+            saves=$(curl --fail --silent http://localhost:8080/api/saves)
+            case $saves in *'"waiting"'* | *'"saving"'*) sleep 1 ;; *) break ;; esac
+          done
+          echo "$saves"
+          ls -lA "$RUNNER_TEMP/home/Moments"
+          test "$(ls -A "$RUNNER_TEMP/home/Moments")" = Clip.mp4
       - name: Server log
         if: always()
         run: docker logs moments

@@ -39,16 +39,22 @@ func main() {
 		slog.Error("can't find app data: set MOMENTS_DATA to its folder", "path", data)
 		os.Exit(1)
 	}
+	handler, err := newHandler(home, data)
+	if err != nil {
+		slog.Error("can't pick up the Saves kept", "err", err)
+		os.Exit(1)
+	}
 	slog.Info("listening", "addr", addr, "home", home.Name(), "data", data)
-	err = http.ListenAndServe(addr, newHandler(home, data))
+	err = http.ListenAndServe(addr, handler)
 	slog.Error("server stopped", "err", err)
 	os.Exit(1)
 }
 
 // newHandler serves the UI, and the API over the folder home, with its cache
-// in the app data folder data. Every path the page sends goes through home,
-// so it can't reach outside it, through ".." or a link.
-func newHandler(home *os.Root, data string) http.Handler {
+// and its Saves in the app data folder data. Every path the page sends goes
+// through home, so it can't reach outside it, through ".." or a link. It fails
+// when the Saves kept there can't be read.
+func newHandler(home *os.Root, data string) (http.Handler, error) {
 	ui, _ := fs.Sub(dist, "web/dist") // errors only on an invalid path
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServerFS(ui))
@@ -142,7 +148,7 @@ func newHandler(home *os.Root, data string) http.Handler {
 		// Named after the Source's path, size and modification time too, so a
 		// Source replaced in place gets thumbnails of its own.
 		name := fmt.Sprintf("thumbnails/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%q %d %d %g", src.Name(), info.Size(), info.ModTime().UnixNano(), at)))
-		jpeg, err := cached(data, name, func() ([]byte, error) { return grabFrame(r.Context(), src, at) })
+		jpeg, err := cached(data, name, func() ([]byte, error) { return grabFrame(r.Context(), src, at, 320) })
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -151,12 +157,17 @@ func newHandler(home *os.Root, data string) http.Handler {
 		w.Write(jpeg)
 	})
 	// Where a Moment of the Source at ?path= can start and end around the time
-	// ?at=, in seconds of its own time (media.go): what the Trimmer's marks snap
-	// to.
+	// ?at=, through the time ?to= when given, in seconds of its own time
+	// (media.go): what the Trimmer's marks snap and nudge to.
 	mux.HandleFunc("GET /api/source/frames", func(w http.ResponseWriter, r *http.Request) {
 		at, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("at"), "0"), 64)
 		if err != nil || math.IsNaN(at) || math.IsInf(at, 0) {
 			http.Error(w, "at isn't a time in seconds", http.StatusBadRequest)
+			return
+		}
+		to, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("to"), r.URL.Query().Get("at"), "0"), 64)
+		if err != nil || math.IsNaN(to) || math.IsInf(to, 0) {
+			http.Error(w, "to isn't a time in seconds", http.StatusBadRequest)
 			return
 		}
 		src, err := sourceFile(home, r.URL.Query().Get("path"))
@@ -165,7 +176,7 @@ func newHandler(home *os.Root, data string) http.Handler {
 			return
 		}
 		defer src.Close()
-		f, err := framesAround(r.Context(), src, at)
+		f, err := framesAround(r.Context(), src, at, to)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -173,11 +184,117 @@ func newHandler(home *os.Root, data string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(f)
 	})
+	// Saves the Moment of the Source at path from start to end, in seconds of
+	// its own time, with the audio track audio, counted from 0 in the probe's
+	// list, else the default, under title (saves.go). It answers at once: the
+	// Save runs on its own, and GET lists it until it's done.
+	saves, err := newSaves(home, data)
+	if err != nil {
+		return nil, err
+	}
+	mux.HandleFunc("POST /api/saves", func(w http.ResponseWriter, r *http.Request) {
+		var s save
+		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+			http.Error(w, "the Save isn't JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if s.End < s.Start {
+			http.Error(w, "the Save ends before it starts", http.StatusBadRequest)
+			return
+		}
+		src, err := sourceFile(home, s.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		defer src.Close()
+		m, err := readSource(r.Context(), src)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if s.Audio != nil && (*s.Audio < 0 || *s.Audio >= len(m.tracks)) {
+			http.Error(w, "audio isn't one of the Source's audio tracks", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(saves.add(s))
+	})
+	mux.HandleFunc("GET /api/saves", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(saves.all())
+	})
+	refuse := func(w http.ResponseWriter, err error) {
+		status := http.StatusBadRequest
+		switch err {
+		case errNoSave:
+			status = http.StatusNotFound
+		case errNotFailed:
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+	}
+	mux.HandleFunc("POST /api/saves/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		var s save
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err == nil {
+			s, err = saves.retry(id)
+		}
+		if err != nil {
+			refuse(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(s)
+	})
+	mux.HandleFunc("DELETE /api/saves/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err == nil {
+			err = saves.dismiss(id)
+		}
+		if err != nil {
+			refuse(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /api/moments", func(w http.ResponseWriter, r *http.Request) {
+		library, err := listLibrary(r.Context(), home, data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(library)
+	})
+	mux.HandleFunc("GET /api/moments/{title}/poster", func(w http.ResponseWriter, r *http.Request) {
+		file, err := openMoment(home, r.PathValue("title"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Without the file's name, so a Moment renamed in Files keeps its poster.
+		name := fmt.Sprintf("posters/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%d %d", info.Size(), info.ModTime().UnixNano())))
+		jpeg, err := cached(data, name, func() ([]byte, error) { return grabFrame(r.Context(), file, 0, 640) })
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(jpeg)
+	})
 	mux.HandleFunc("GET /api/mounts", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(mounts(home.Name()))
 	})
-	return mux
+	return mux, nil
 }
 
 // typedStream passes a stream on to the page with, as its Content-Type, the
@@ -258,8 +375,8 @@ func cached(data, name string, build func() ([]byte, error)) ([]byte, error) {
 	return b, nil
 }
 
-// writeWhole writes b to file, under another name until it's whole, so that
-// nothing reads half of it, even after a crash.
+// writeWhole writes b to file, under another name until it's whole and on
+// disk, so that nothing reads half of it, even after a crash or a power cut.
 func writeWhole(file string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 		return err
@@ -270,7 +387,7 @@ func writeWhole(file string, b []byte) error {
 	}
 	defer os.Remove(tmp.Name()) // nothing to remove once renamed
 	_, err = tmp.Write(b)
-	if err := errors.Join(err, tmp.Close()); err != nil {
+	if err := errors.Join(err, tmp.Sync(), tmp.Close()); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), file)

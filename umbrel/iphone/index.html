@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>iPhone check</title>
+		<link rel="icon" href="data:," />
+		<style>
+			:root {
+				color-scheme: light dark;
+			}
+			body {
+				font: 15px/1.4 -apple-system, system-ui, sans-serif;
+				margin: 16px 16px 120px;
+			}
+			button {
+				font: inherit;
+				font-weight: 600;
+				padding: 12px 32px;
+			}
+			pre {
+				font-size: 12px;
+				white-space: pre-wrap;
+				word-break: break-word;
+			}
+			/* iOS may pause a muted video that leaves the screen. */
+			video {
+				position: fixed;
+				right: 8px;
+				bottom: 8px;
+				width: 160px;
+				height: 90px;
+				background: #000;
+			}
+		</style>
+		<script>
+			let posted = Promise.resolve(true);
+			function post(line) {
+				posted = posted.then((ok) =>
+					fetch("results", { method: "POST", body: line }).then(
+						(answer) => ok && answer.ok,
+						() => false,
+					),
+				);
+			}
+			addEventListener("error", (event) => post(`error: the page threw ${event.message}`));
+			addEventListener("unhandledrejection", (event) => post(`error: the page threw ${event.reason}`));
+		</script>
+	</head>
+	<body>
+		<h1>Moments iPhone check</h1>
+		<p id="status">Loading…</p>
+		<p><button id="start" disabled>Start</button></p>
+		<pre id="report"></pre>
+		<video muted playsinline preload="auto"></video>
+		<script type="module">
+			const PLAYING_S = 0.5;
+			const COLOURS = 16; // in a testsrc2 frame; a flat or empty one has 1
+			const FPS = 30;
+			const LOOPS = 3;
+			const SEEK_S = 0.617;
+			const RUN = Math.random().toString(36).slice(2, 6);
+			const status = document.getElementById("status");
+			const start = document.getElementById("start");
+			const report = document.getElementById("report");
+			const video = document.querySelector("video");
+			const canvas = document.createElement("canvas");
+			canvas.width = 320;
+			canvas.height = 180;
+			const context = canvas.getContext("2d", { willReadFrequently: true });
+			const sleep = (durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs));
+
+			async function until(done, timeoutMs) {
+				const end = performance.now() + timeoutMs;
+				while (!done() && performance.now() < end) await sleep(50);
+			}
+
+			function say(line) {
+				report.textContent += `${line}\n`;
+				post(`${RUN} ${line}`);
+			}
+
+			function eachFrame(onFrame, timeoutMs) {
+				return new Promise((resolve) => {
+					let handle;
+					const timer = setTimeout(() => {
+						video.cancelVideoFrameCallback(handle);
+						resolve();
+					}, timeoutMs);
+					const next = () => {
+						handle = video.requestVideoFrameCallback((now, metadata) => {
+							if (!onFrame(now, metadata)) return next();
+							clearTimeout(timer);
+							resolve();
+						});
+					};
+					next();
+				});
+			}
+
+			function draw() {
+				context.drawImage(video, 0, 0, canvas.width, canvas.height);
+				return context.getImageData(0, 0, canvas.width, canvas.height).data;
+			}
+
+			function colours() {
+				const pixels = draw();
+				const seen = new Set();
+				for (let i = 0; i < pixels.length; i += 4) {
+					seen.add(`${pixels[i] >> 5},${pixels[i + 1] >> 5},${pixels[i + 2] >> 5}`);
+				}
+				return seen.size;
+			}
+
+			// The frame number in the 8 bars across the top of every test Moment.
+			function frameNumber() {
+				const pixels = draw();
+				const row = 5 * canvas.width * 4;
+				let number = 0;
+				for (let bit = 0; bit < 8; bit++) {
+					if (pixels[row + (40 * bit + 20) * 4] > 128) number |= 1 << bit;
+				}
+				return number;
+			}
+
+			function load(test, loop = false) {
+				video.loop = loop;
+				video.src = `media/${test.file}`;
+				let refused = "";
+				video.play().catch((exception) => {
+					refused = `${exception.name}: ${exception.message}`;
+				});
+				return () => refused;
+			}
+
+			async function decodes(test) {
+				const refused = load(test);
+				await until(() => video.error || refused() || video.currentTime >= PLAYING_S, 8000);
+				if (video.error) return { verdict: "fails", detail: `MediaError ${video.error.code}: ${video.error.message}` };
+				if (refused()) return { verdict: "fails", detail: refused() };
+				const clock = `clock ${video.currentTime.toFixed(2)} s`;
+				if (video.currentTime < PLAYING_S) return { verdict: "fails", detail: `${clock}, stalled` };
+				if (test.file.endsWith(".mp4")) {
+					let count = 0;
+					await until(() => (count = colours()) >= COLOURS, 1000);
+					const frame = `${video.videoWidth}x${video.videoHeight}, ${count} colours`;
+					return { verdict: count >= COLOURS ? "plays" : "fails", detail: `${clock}, ${frame}` };
+				}
+				const [count, what] =
+					"webkitAudioDecodedByteCount" in video
+						? [video.webkitAudioDecodedByteCount, "audio bytes decoded"]
+						: [video.audioTracks.length, "audio tracks"];
+				return { verdict: count > 0 ? "plays" : "fails", detail: `${clock}, ${what}: ${count}` };
+			}
+
+			async function loops(test) {
+				const seams = [];
+				const restarts = [];
+				let previous;
+				load(test, true);
+				await eachFrame((now, { mediaTime }) => {
+					if (previous && mediaTime < previous.mediaTime) {
+						seams.push(Math.round(now - previous.now));
+						restarts.push(frameNumber());
+					}
+					previous = { now, mediaTime };
+					return seams.length === LOOPS;
+				}, LOOPS * 1000 + 5000);
+				video.loop = false;
+				say(
+					`loop ${test.label}: ${seams.length} of ${LOOPS} loops, seams ${seams.join(", ")} ms, restarting at frames ${restarts.join(", ")}`,
+				);
+			}
+
+			async function queueSwitches(tests) {
+				const switches = [];
+				let endedAt;
+				for (const test of tests) {
+					let shownAt;
+					const ended = new Promise((resolve) =>
+						video.addEventListener("ended", () => resolve(performance.now()), { once: true }),
+					);
+					load(test);
+					await eachFrame((now) => {
+						shownAt = now;
+						return true;
+					}, 5000);
+					if (endedAt) switches.push(`${test.label} ${shownAt ? `${Math.round(shownAt - endedAt)} ms` : "no frame"}`);
+					endedAt = await Promise.race([ended, sleep(5000)]);
+					if (!endedAt) {
+						switches.push(`${test.label} never ended${video.error ? `: MediaError ${video.error.code}` : ""}`);
+						break;
+					}
+				}
+				say(`queue switches: to ${switches.join(", to ")}`);
+			}
+
+			async function seek(test) {
+				const refused = load(test);
+				await until(() => video.error || refused() || video.currentTime > 0.1, 5000);
+				video.pause();
+				const seeked = new Promise((resolve) => video.addEventListener("seeked", resolve, { once: true }));
+				video.currentTime = SEEK_S;
+				await Promise.race([seeked, sleep(5000)]);
+				await eachFrame(() => true, 500);
+				say(`seek to ${SEEK_S} s in ${test.label}: frame ${frameNumber()}, want ${Math.floor(SEEK_S * FPS)}`);
+			}
+
+			// Nothing awaits before the first play(), so the tap that starts the run lets the video play.
+			async function run({ codecs, queue }) {
+				start.hidden = true;
+				status.textContent = "Running: keep the screen on, about a minute.";
+				say(`run ${new Date().toISOString()} ${navigator.userAgent}`);
+				const mismatches = [];
+				for (const test of codecs) {
+					const { verdict, detail } = await decodes(test);
+					const unexpected = verdict !== test.want;
+					if (unexpected) mismatches.push(`${test.file} ${verdict}, want ${test.want}`);
+					say(`${test.file}: ${verdict}${unexpected ? `, want ${test.want}` : ""}: ${detail}`);
+				}
+				await loops(queue[0]);
+				await queueSwitches(queue);
+				await seek(queue[0]);
+				await seek(queue.at(-1));
+				video.pause();
+				say(mismatches.length ? `FAIL: ${mismatches.join("; ")}` : "pass: every test Moment as #13's iPhone column says");
+				status.textContent = (await posted)
+					? "Done, and the results reached the Umbrel."
+					: "Done, but sending the results failed: screenshot this page.";
+			}
+
+			const manifest = await (await fetch("manifest.json")).json();
+			status.textContent = "Tap Start, then keep the screen on for about a minute.";
+			start.disabled = false;
+			start.onclick = () => run(manifest);
+			if (new URLSearchParams(location.search).has("auto")) run(manifest);
+		</script>
+	</body>
+</html>

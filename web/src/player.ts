@@ -23,6 +23,10 @@ export type AudioTrack = {
 // stream waits, and so does its FFmpeg on the Umbrel.
 const AHEAD_S = 30;
 
+// How long, in milliseconds, a hold lasts before it plays again, when it was
+// playing, as in the trimming prototype.
+const HOLD_MS = 700;
+
 /** A Source playing in the Trimmer. */
 export type Playback = {
 	/**
@@ -46,6 +50,15 @@ export type Playback = {
 	 * them, it plays on.
 	 */
 	loop(start?: number, end?: number): void;
+	/**
+	 * Pauses on the frame at time, in seconds of the Source's own time, as a
+	 * loop playing moves to start and end, and keeps that frame on screen,
+	 * outside the loop or on its last frame too. When it was playing, it plays
+	 * again from the frame at from HOLD_MS after the last hold, unless played,
+	 * sought or unlooped before. Played from a frame outside the loop, or on
+	 * its last, it goes to the loop's start first.
+	 */
+	hold(time: number, from: number, start?: number, end?: number): void;
 	/**
 	 * Plays the audio track track, counted from 0 in the probe's list, from the
 	 * frame on screen, in a new stream.
@@ -93,17 +106,37 @@ export function playSource(
 	// into a frame as it is: at its own time, Chrome can show the frame before
 	// (#11).
 	let aim = 0;
+	let held = false; // on a frame the loop leaves alone, until it plays again
+	let resume = false; // whether the holds since it last played began playing
+	let again: ReturnType<typeof setTimeout> | undefined; // the holds' play
+	const dontResume = () => {
+		clearTimeout(again);
+		resume = false;
+	};
 	// The frame clock is mediaTime, the frame's own time, never a count of
 	// callbacks, which WebKit sometimes skips (#11).
 	video.requestVideoFrameCallback(function frame(_, { mediaTime }) {
 		if (stop.signal.aborted) return;
 		if (!video.seeking && !replacing) {
 			aim = mediaTime + frameLength / 2;
-			loopBack();
+			if (!held) loopBack();
 		}
 		onFrame?.(mediaTime);
 		video.requestVideoFrameCallback(frame);
 	});
+	// Played again from a frame held outside the loop, or on its last, it plays
+	// from the loop's start, and the holds no longer play by themselves. A play
+	// paused at once doesn't count.
+	video.addEventListener(
+		"play",
+		() => {
+			if (video.paused) return;
+			held = false;
+			dontResume();
+			loopBack();
+		},
+		{ signal: stop.signal },
+	);
 
 	// What the buffer takes, with its codecs, as each stream's Content-Type
 	// gives them: a stream of another audio track can carry another codec.
@@ -226,24 +259,48 @@ export function playSource(
 		seek(looping.start + 0.001);
 		return true;
 	};
+	// The owner's seeks, after which a hold doesn't play again.
+	const seekTo = (time: number) => {
+		dontResume();
+		seek(time);
+	};
 	return {
-		seek,
+		seek: seekTo,
 		playhead: () => aim,
-		jump: (seconds) => seek(aim + seconds),
-		step: (frames) => seek(aim + frames * frameLength),
+		jump: (seconds) => seekTo(aim + seconds),
+		step: (frames) => seekTo(aim + frames * frameLength),
 		loop: (start, end) => {
-			const off = !looping;
+			const was = looping;
 			looping =
 				start === undefined || end === undefined ? undefined : { start, end };
+			// As it was, as a hold leaves it, nothing changes.
+			if (was?.start === looping?.start && was?.end === looping?.end) return;
+			if (!looping) dontResume();
 			// Turned on, it plays from the start; moved, from there only when the
 			// frame aimed at is now outside it.
-			if (loopBack(off)) video.play().catch(() => {});
+			if (loopBack(!was)) video.play().catch(() => {});
+		},
+		hold: (time, from, start, end) => {
+			resume ||= !video.paused;
+			held = true;
+			if (looping && start !== undefined && end !== undefined)
+				looping = { start, end };
+			video.pause();
+			seek(time + frameLength / 2);
+			clearTimeout(again);
+			// A millisecond into from's frame, as the loop goes back to its start.
+			if (resume)
+				again = setTimeout(() => {
+					seek(from + 0.001);
+					video.play().catch(() => {});
+				}, HOLD_MS);
 		},
 		switchAudio: (track) => {
 			audio = String(track);
 			streamFrom(aim);
 		},
 		stop: () => {
+			dontResume();
 			stop.abort();
 			URL.revokeObjectURL(video.src);
 			video.removeAttribute("src");

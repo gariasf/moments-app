@@ -1,6 +1,13 @@
-import { ArrowLeft } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import {
+	ArrowLeft,
+	ChevronLeft,
+	ChevronRight,
+	ChevronsLeft,
+	ChevronsRight,
+} from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
 	Select,
 	SelectContent,
@@ -8,11 +15,63 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { around, type Frames, type Marks, noMarks, press, seek } from "./marks";
+import {
+	around,
+	FAR,
+	type Frames,
+	type Marks,
+	type Nudge,
+	noMarks,
+	nudge,
+	prefill,
+	press,
+	type Span,
+	seek,
+	span,
+} from "./marks";
 import { type AudioTrack, getJSON, type Playback, playSource } from "./player";
 import { SourceBrowser } from "./SourceBrowser";
 
 type Source = { path: string; sourceName: string };
+
+// A Save as the server lists it until it's done (saves.go).
+type Save = {
+	id: number; // below 0 for one the server refused
+	path: string;
+	start: number;
+	end: number;
+	title: string;
+	state: "waiting" | "saving" | "failed";
+	error?: string;
+	percent?: number;
+	answered?: number; // when the server took it, by performance.now()
+	sent?: string; // the request of one the server refused, sent again on Retry
+};
+
+type Moment = {
+	title: string;
+	length: number;
+	sourcePath?: string;
+	start: number;
+	end: number;
+	last?: number;
+};
+
+type Made = {
+	key: string;
+	title: string;
+	start: number;
+	end: number;
+	marks?: { start: number; end: number };
+	save?: Save;
+	length?: number;
+};
+
+async function askForSave(url: string, request: RequestInit): Promise<Save> {
+	const response = await fetch(url, request);
+	if (!response.ok) throw new Error((await response.text()).trim());
+	return { ...((await response.json()) as Save), answered: performance.now() };
+}
 
 // The Trimmer opens on its Source browser and plays the Source picked there.
 export function Trimmer({ onBack }: { onBack: () => void }) {
@@ -33,11 +92,11 @@ export function Trimmer({ onBack }: { onBack: () => void }) {
 				</h1>
 			</header>
 			<main className="mx-auto w-full max-w-5xl px-4 pb-6">
-				{source && <Player key={source.path} path={source.path} />}
+				{source && <Player key={source.path} {...source} />}
 				{/* Kept while a Source plays, so going back finds the same folder or
 				search. */}
 				<div hidden={!!source} className="mx-auto max-w-3xl">
-					<SourceBrowser onOpen={setSource} />
+					<SourceBrowser onOpen={setSource} shown={!source} />
 				</div>
 			</main>
 		</>
@@ -48,9 +107,14 @@ export function Trimmer({ onBack }: { onBack: () => void }) {
 // pauses it, J and L jump 10 s back and forward, and ← and → step a frame
 // while paused and 5 s while playing. I and O mark a Moment's start and end
 // (marks.ts), and Esc clears them. Once both are marked, the marked stretch
-// loops until a seek away from it, and \ turns the loop off and on. A Source
-// with several audio tracks plays its default until another is picked.
-function Player({ path }: { path: string }) {
+// loops until a seek away from it, and \ turns the loop off and on. With the
+// edge selected marked, ← and → nudge it, and ⇧← and ⇧→ further, as the
+// nudge buttons do, and Tab selects the other edge. A Source with several
+// audio tracks plays its default until another is picked. Enter or Save saves
+// the marked Moment, with the audio track playing, under the title in its
+// field, prefilled from sourceName and the start: the marks clear, playback
+// carries on from the end, and the Save shows until it's saved.
+function Player({ path, sourceName }: Source) {
 	const video = useRef<HTMLVideoElement>(null);
 	const playback = useRef<Playback>(null);
 	const [problem, setProblem] = useState("");
@@ -60,6 +124,196 @@ function Player({ path }: { path: string }) {
 	const [tracks, setTracks] = useState<AudioTrack[]>([]);
 	const [track, setTrack] = useState(0); // the one playing, from 0
 	const [marks, setMarks] = useState(noMarks);
+	// The marks as the latest change left them, which keys read before React
+	// renders them.
+	const latest = useRef(noMarks);
+	const change = useCallback((edit: (marks: Marks) => Marks) => {
+		latest.current = edit(latest.current);
+		setMarks(latest.current);
+	}, []);
+	// What the nudge buttons call, set by the keys' effect, so that their nudges
+	// wait their turn with the keys'.
+	const nudging = useRef<(nudge: Nudge) => void>(undefined);
+	// The title the owner typed, else the field shows the prefilled one.
+	const [title, setTitle] = useState<string>();
+	const [saves, setSaves] = useState<Save[]>([]); // in the order made
+	const [moments, setMoments] = useState<Moment[]>([]); // oldest first
+	const savesNow = useRef(saves);
+	savesNow.current = saves;
+	const lastFrames = useRef(new Map<number, number>());
+	const refused = useRef(0); // how many Saves the server refused
+	// What Enter, Save and the title field call, set by the keys' effect, so a
+	// Save waits for the marks pressed before it; and the save it calls, as the
+	// latest render has the title and audio track.
+	const saving = useRef<() => void>(undefined);
+	const saveMarks = useRef<() => void>(undefined);
+	const put = (save: Save, replacing?: number) =>
+		setSaves((all) =>
+			replacing === undefined
+				? [...all, save]
+				: all.map((other) => (other.id === replacing ? save : other)),
+		);
+	const send = (sent: string, replacing?: number) =>
+		askForSave("/api/saves", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: sent,
+		}).then(
+			(made) => put(made, replacing),
+			(error: Error) =>
+				put(
+					{
+						...JSON.parse(sent),
+						id: -++refused.current,
+						state: "failed",
+						error: error.message,
+						sent,
+					},
+					replacing,
+				),
+		);
+	const retry = (save: Save) => {
+		if (save.sent) {
+			send(save.sent, save.id);
+			return;
+		}
+		askForSave(`/api/saves/${save.id}/retry`, { method: "POST" }).then(
+			(made) => put(made, save.id),
+			(error: Error) => put({ ...save, error: error.message }, save.id),
+		);
+	};
+	const dismiss = async (save: Save) => {
+		try {
+			if (!save.sent) {
+				const response = await fetch(`/api/saves/${save.id}`, {
+					method: "DELETE",
+				});
+				if (!response.ok && response.status !== 404)
+					throw new Error((await response.text()).trim());
+			}
+		} catch (error) {
+			put(
+				{ ...save, error: `Dismiss failed: ${(error as Error).message}` },
+				save.id,
+			);
+			return;
+		}
+		setSaves((all) => all.filter((other) => other.id !== save.id));
+	};
+	const made: Made[] = [
+		...moments.map((moment) => ({
+			key: `moment ${moment.start} ${moment.end} ${moment.title}`,
+			title: moment.title,
+			start: moment.start,
+			end: moment.end,
+			length: moment.length,
+			marks:
+				moment.last === undefined
+					? undefined
+					: { start: moment.start, end: moment.last },
+		})),
+		...saves.map((save) => ({
+			key: `save ${save.id}`,
+			title: save.title,
+			start: save.start,
+			end: save.end,
+			marks: { start: save.start, end: save.end },
+			save,
+		})),
+	];
+	const taken = ({ start, end }: Marks) =>
+		made.some((item) => item.marks?.start === start && item.marks?.end === end);
+	const loadMoments = async (signal: AbortSignal) => {
+		const library = await getJSON<Moment[]>("/api/moments", signal);
+		const fromHere = library
+			.filter((moment) => moment.sourcePath === path)
+			.reverse();
+		return Promise.all(
+			fromHere.map(async (moment) => {
+				const end = moment.end || moment.start + moment.length;
+				const before = end - 0.001;
+				if (!lastFrames.current.has(end)) {
+					const frames = await framesAround(
+						path,
+						[[before, before]],
+						signal,
+					).catch(() => undefined);
+					const ends = (frames?.cleanEnds ?? []).filter(
+						(time) => time <= before,
+					);
+					if (ends.length) lastFrames.current.set(end, Math.max(...ends));
+				}
+				return { ...moment, end, last: lastFrames.current.get(end) };
+			}),
+		);
+	};
+	const newestApplied = useRef(0);
+	const refresh =
+		useRef<(signal: AbortSignal, withMoments?: boolean) => void>(undefined);
+	refresh.current = async (signal, withMoments) => {
+		const asked = performance.now();
+		const listed = await getJSON<Save[]>("/api/saves", signal).catch(
+			() => undefined,
+		);
+		if (!listed) return;
+		const ours = listed.filter((save) => save.path === path);
+		const unlisted = (save: Save) =>
+			!ours.some((other) => other.id === save.id);
+		// A list asked for before the server took a Save doesn't hold it yet.
+		const pending = (save: Save) => save.id < 0 || (save.answered ?? 0) > asked;
+		const done = savesNow.current.some(
+			(save) => unlisted(save) && !pending(save),
+		);
+		let fromHere: Moment[] | undefined;
+		if (withMoments || done) {
+			fromHere = await loadMoments(signal).catch(() => undefined);
+			if (!fromHere) return;
+		}
+		if (fromHere) setMoments(fromHere);
+		if (asked < newestApplied.current) return;
+		newestApplied.current = asked;
+		setSaves((all) => [
+			...ours,
+			...all.filter((save) => unlisted(save) && pending(save)),
+		]);
+	};
+	useEffect(() => {
+		saveMarks.current = () => {
+			const { start, end } = latest.current;
+			if (start === undefined || end === undefined || taken(latest.current))
+				return;
+			const named = title?.trim() || prefill(sourceName, start);
+			change(() => noMarks);
+			setTitle(undefined);
+			// Playback carries on from the end's frame, a millisecond in, as the
+			// loop's start; without the loop, which would go back from there. The
+			// Save is sent even once the Source is closed, as Enter asked.
+			playback.current?.loop();
+			playback.current?.seek(end + 0.001);
+			video.current?.play().catch(() => {});
+			const audio = track < 0 ? undefined : track;
+			send(JSON.stringify({ path, start, end, audio, title: named }));
+		};
+	});
+	useEffect(() => {
+		const stop = new AbortController();
+		refresh.current?.(stop.signal, true);
+		return () => stop.abort();
+	}, []);
+	const onItsWay = saves.some(
+		(save) => save.state === "waiting" || save.state === "saving",
+	);
+	useEffect(() => {
+		if (!onItsWay) return;
+		const stop = new AbortController();
+		const poll = () => refresh.current?.(stop.signal);
+		poll();
+		const every = setInterval(poll, 1000);
+		return () => {
+			clearInterval(every);
+			stop.abort();
+		};
+	}, [onItsWay]);
 	useEffect(() => {
 		if (!video.current) return;
 		playback.current = playSource(
@@ -86,18 +340,64 @@ function Player({ path }: { path: string }) {
 		// in the order their keys were pressed.
 		const stop = new AbortController();
 		let marking = Promise.resolve();
+		let queued = 0; // marks waiting their turn
+		const later = (mark: () => Promise<void>) => {
+			queued++;
+			marking = marking
+				.then(mark)
+				.catch(() => {}) // a mark the server can't place isn't made
+				.finally(() => queued--);
+		};
 		// moved tells the marks where a seek went: away from them, the loop stops.
-		const moved = (p: Playback) => setMarks((m) => seek(m, p.playhead()));
+		const moved = (p: Playback) => change((m) => seek(m, p.playhead()));
+		// move nudges a button's edge, or an arrow's, the one selected by the time
+		// its turn comes, and the preview holds on it (player.ts). An arrow with
+		// that edge unmarked steps the playhead: a frame while paused, 5 s while
+		// playing.
+		const move = (n: Nudge) =>
+			later(async () => {
+				const [v, p] = [video.current, playback.current];
+				const over = span(latest.current, n);
+				if (over) {
+					const frames = await framesAround(path, [over], stop.signal);
+					const { marks: next, preview } = nudge(latest.current, n, frames);
+					change(() => next);
+					if (preview)
+						p?.hold(preview.hold, preview.play, next.start, next.end);
+				} else if (!n.edge && !n.far && v && p) {
+					if (v.paused) p.step(n.by);
+					else p.jump(5 * n.by);
+					moved(p);
+				}
+			});
+		nudging.current = move;
+		saving.current = () => later(async () => saveMarks.current?.());
 		const onKey = (e: KeyboardEvent) => {
 			const [v, p] = [video.current, playback.current];
 			const key = e.key.toLowerCase();
-			// But \, typed with ⌥ on a Spanish keyboard, and ⌥⇧ on a German one.
+			const arrowKey = key === "arrowleft" || key === "arrowright";
+			// But \, typed with ⌥ on a Spanish keyboard, and ⌥⇧ on a German one,
+			// and ⇧← and ⇧→, which nudge further.
 			const modified =
-				e.metaKey || e.ctrlKey || (key !== "\\" && (e.altKey || e.shiftKey));
+				e.metaKey ||
+				e.ctrlKey ||
+				(key !== "\\" && (e.altKey || (e.shiftKey && !arrowKey)));
 			if (!v || !p || modified) return;
-			// Keys picking from a list, such as the audio tracks', are the list's.
+			// Keys picking from a list, such as the audio tracks', are the list's,
+			// and keys typed into the title are the title's: Enter there submits
+			// it, and Esc gives the keys back.
 			if (e.target instanceof Element && e.target.closest("[role=listbox]"))
 				return;
+			if (e.target instanceof HTMLInputElement) {
+				if (key === "escape") e.target.blur();
+				return;
+			}
+			// With no edge to select, nor one on its way, Tab moves the focus, as
+			// anywhere, and with no Moment to save, Enter presses the button focused.
+			const marked = latest.current;
+			if (key === "tab" && marked.start === undefined && !queued) return;
+			const whole = marked.start !== undefined && marked.end !== undefined;
+			if (key === "enter" && !whole && !queued) return;
 			switch (key) {
 				case " ":
 					if (!e.repeat) toggle(v);
@@ -111,25 +411,26 @@ function Player({ path }: { path: string }) {
 					moved(p);
 					break;
 				case "arrowleft":
-					if (v.paused) p.step(-1);
-					else p.jump(-5);
-					moved(p);
-					break;
 				case "arrowright":
-					if (v.paused) p.step(1);
-					else p.jump(5);
-					moved(p);
+					// Held down, an arrow goes as fast as the server answers.
+					if (!e.repeat || !queued)
+						move({ by: key === "arrowleft" ? -1 : 1, far: e.shiftKey });
+					break;
+				case "enter":
+					if (!e.repeat) saving.current?.();
 					break;
 				case "i":
 				case "o":
 				case "\\":
-				case "escape": {
+				case "escape":
+				case "tab": {
 					if (e.repeat) break;
 					const at = p.playhead();
-					marking = marking
-						.then(() => framesAround(path, around(key, at), stop.signal))
-						.then((frames) => setMarks((m) => press(m, key, at, frames)))
-						.catch(() => {}); // a mark the server can't place isn't made
+					later(async () => {
+						const spans = around(key, at);
+						const frames = await framesAround(path, spans, stop.signal);
+						change((m) => press(m, key, at, frames));
+					});
 					break;
 				}
 				default:
@@ -139,13 +440,14 @@ function Player({ path }: { path: string }) {
 			e.stopPropagation(); // nor a pick by first letter on the focused picker
 		};
 		// Before the page's own handlers, so the keys are the Trimmer's wherever
-		// the focus is, but in a list.
+		// the focus is, but in a list or the title.
 		addEventListener("keydown", onKey, true);
 		return () => {
 			stop.abort();
+			nudging.current = saving.current = undefined;
 			removeEventListener("keydown", onKey, true);
 		};
-	}, [path]);
+	}, [path, change]);
 	return (
 		<div className="flex flex-col gap-2">
 			{problem && (
@@ -173,9 +475,10 @@ function Player({ path }: { path: string }) {
 					time={time}
 					duration={duration}
 					marks={marks}
+					made={made}
 					onSeek={(to) => {
 						playback.current?.seek(to);
-						setMarks((m) => seek(m, to));
+						change((m) => seek(m, to));
 					}}
 				/>
 				<div className="flex">
@@ -202,15 +505,157 @@ function Player({ path }: { path: string }) {
 					/>
 				)}
 			</div>
+			<div hidden={!!problem}>
+				<Nudges marks={marks} onNudge={(n) => nudging.current?.(n)} />
+			</div>
 			<p role="status" hidden={!!problem} className="min-h-5 text-sm">
 				{marks.note && `Start: ${marks.note}`}
 			</p>
+			<form
+				hidden={!!problem}
+				onSubmit={(e) => {
+					e.preventDefault();
+					// Then the keys are the Trimmer's again.
+					if (document.activeElement instanceof HTMLElement)
+						document.activeElement.blur();
+					saving.current?.();
+				}}
+				className="flex gap-2"
+			>
+				<Input
+					aria-label="Title"
+					placeholder="Title"
+					value={
+						title ??
+						(marks.start === undefined ? "" : prefill(sourceName, marks.start))
+					}
+					onChange={(e) => setTitle(e.target.value)}
+				/>
+				<Button
+					type="submit"
+					disabled={
+						marks.start === undefined || marks.end === undefined || taken(marks)
+					}
+				>
+					Save
+				</Button>
+			</form>
+			{made.length > 0 && (
+				<h2 hidden={!!problem} className="font-medium text-sm">
+					Made from this Source
+				</h2>
+			)}
+			{/* Live, and there from the start, so a screen reader says how each
+			Save goes. */}
+			<ul
+				hidden={!!problem}
+				aria-label="Made from this Source"
+				aria-live="polite"
+				className="text-sm"
+			>
+				{made.map(({ key, title, marks: madeFrom, save, length }) => (
+					<li key={key} className="flex flex-wrap items-center gap-x-2">
+						<Button
+							variant="ghost"
+							size="xs"
+							className="-ml-2 font-normal"
+							disabled={!madeFrom}
+							onClick={() =>
+								madeFrom &&
+								change(() => ({
+									...madeFrom,
+									edge: "end",
+									loop: true,
+									note: "",
+								}))
+							}
+						>
+							{title}
+						</Button>
+						<span className="text-muted-foreground tabular-nums">
+							{!save
+								? clock(length ?? 0, length ?? 0)
+								: save.state === "failed"
+									? save.sent
+										? `Save failed: ${save.error}`
+										: save.error
+									: save.state === "saving"
+										? `Saving ${save.percent ?? 0}%`
+										: "Waiting"}
+						</span>
+						{save?.state === "failed" && (
+							<span className="flex gap-1">
+								<Button variant="outline" size="xs" onClick={() => retry(save)}>
+									Retry
+								</Button>
+								<Button variant="ghost" size="xs" onClick={() => dismiss(save)}>
+									Dismiss
+								</Button>
+							</span>
+						)}
+					</li>
+				))}
+			</ul>
 			<p hidden={!!problem} className="text-muted-foreground text-xs">
 				Space or a click plays and pauses. J and L jump 10 s; ← and → step a
 				frame while paused, and 5 s while playing. I and O mark the start and
 				end, which then loop until you seek away; \ turns the loop off and on,
-				and Esc clears the marks.
+				and Esc clears the marks. Once an edge is marked, ← and → move it: the
+				start a keyframe, the end to the next frame it can end on, and with ⇧,
+				about {FAR.start} s and {FAR.end} s. Tab selects the other edge. Enter
+				saves the marked Moment under its title, and playback carries on from
+				its end.
 			</p>
+		</div>
+	);
+}
+
+// Nudges has buttons that move each marked edge as ← and → do, and ⇧← and ⇧→
+// (marks.ts), giving onNudge the nudge, and picks out the edge selected.
+function Nudges({
+	marks,
+	onNudge,
+}: {
+	marks: Marks;
+	onNudge: (nudge: Nudge) => void;
+}) {
+	return (
+		<div className="flex flex-wrap gap-x-6 gap-y-1">
+			{(["start", "end"] as const).map((edge) => {
+				const name = edge === "start" ? "Start" : "End";
+				const step = edge === "start" ? "a keyframe" : "a frame it can end on";
+				const about = `about ${FAR[edge]} s`;
+				const selected = marks.start !== undefined && marks.edge === edge;
+				return (
+					<div key={edge} className="flex items-center gap-0.5">
+						<span
+							className={`mr-1 w-9 text-sm ${selected ? "font-medium" : "text-muted-foreground"}`}
+						>
+							{name}
+						</span>
+						{(
+							[
+								[-1, true, ChevronsLeft, `${about} earlier`, "⇧←"],
+								[-1, false, ChevronLeft, `${step} earlier`, "←"],
+								[1, false, ChevronRight, `${step} later`, "→"],
+								[1, true, ChevronsRight, `${about} later`, "⇧→"],
+							] as const
+						).map(([by, far, Icon, label, key]) => (
+							<Button
+								key={key}
+								size="icon-sm"
+								variant="ghost"
+								disabled={marks[edge] === undefined}
+								aria-label={`${name} ${label}`}
+								title={`${name} ${label} (${key})`}
+								onClick={() => onNudge({ edge, by, far })}
+							>
+								<Icon />
+							</Button>
+						))}
+					</div>
+				);
+			})}
 		</div>
 	);
 }
@@ -279,12 +724,14 @@ function SeekBar({
 	time,
 	duration,
 	marks,
+	made,
 	onSeek,
 }: {
 	path: string;
 	time: number;
 	duration: number;
 	marks: Marks;
+	made: Made[];
 	onSeek: (time: number) => void;
 }) {
 	// The spot hovered over, and where its thumbnail goes, along the bar.
@@ -330,6 +777,14 @@ function SeekBar({
 					className="h-full rounded-full bg-primary"
 					style={{ width: along(time) }}
 				/>
+				{made.map(({ key, start, end, save }) => (
+					<div
+						key={key}
+						aria-hidden
+						className={`absolute inset-y-0 ${save?.state === "failed" ? "bg-destructive/70" : save ? "bg-sky-500/30" : "bg-sky-500/70"}`}
+						style={{ left: along(start), width: along(end - start) }}
+					/>
+				))}
 				{marks.start !== undefined && marks.end !== undefined && (
 					<div
 						aria-hidden
@@ -378,16 +833,16 @@ function SeekBar({
 }
 
 // framesAround asks the server where a Moment of the Source at path can start
-// and end around each of times (media.go), in one list.
+// and end over each of spans (media.go), in one list.
 async function framesAround(
 	path: string,
-	times: number[],
+	spans: Span[],
 	signal: AbortSignal,
 ): Promise<Frames> {
 	const all = await Promise.all(
-		times.map((at) =>
+		spans.map(([at, to]) =>
 			getJSON<Frames>(
-				`/api/source/frames?${new URLSearchParams({ path, at: String(at) })}`,
+				`/api/source/frames?${new URLSearchParams({ path, at: String(at), to: String(to) })}`,
 				signal,
 			),
 		),

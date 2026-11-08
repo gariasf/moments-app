@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // A probe is how the Trimmer opens a Source.
@@ -71,6 +72,12 @@ type probedStream struct {
 	// the base rate for when ffprobe can't tell the average.
 	AvgFrameRate  string `json:"avg_frame_rate"`
 	BaseFrameRate string `json:"r_frame_rate"`
+
+	ExtradataBytes int `json:"extradata_size"`
+}
+
+func (stream probedStream) frameLength() float64 {
+	return 1 / cmp.Or(fraction(stream.AvgFrameRate), fraction(stream.BaseFrameRate))
 }
 
 // A source is a Source as ffprobe reads it, with the streams a Moment or the
@@ -138,6 +145,34 @@ func audioArgs(a probedStream) []string {
 	return args
 }
 
+// copyVideo are FFmpeg's output options that copy the video v into an MP4.
+// HEVC from Matroska has no sample entry of its own, and MP4's default is
+// hev1, which Safari won't play as a file. An MP4 Source's hev1 stays: its
+// parameter sets may be in the stream alone, and retagged, its hvcC comes out
+// empty (#11).
+func copyVideo(v probedStream) []string {
+	if v.Codec == "hevc" && v.Tag != "hev1" {
+		return []string{"-c:v", "copy", "-tag:v", "hvc1"}
+	}
+	return []string{"-c:v", "copy"}
+}
+
+func momentVideo(video probedStream) []string {
+	if !untouched(video) {
+		return []string{"-vf", "format=p010le,hwupload", "-c:v", "hevc_vaapi", "-low_power", "1", "-rc_mode", "CQP", "-qp", "22",
+			"-profile:v", "main10", "-tag:v", "hvc1", "-fps_mode", "passthrough"}
+	}
+	if video.Codec != "hevc" {
+		return []string{"-c:v", "copy"}
+	}
+	options := []string{"-c:v", "copy", "-tag:v", "hvc1"}
+	// An hvcC of 23 bytes or less holds no parameter sets; Annex B lets the muxer rebuild it from the stream's.
+	if video.ExtradataBytes <= 23 {
+		options = append(options, "-bsf:v", "hevc_mp4toannexb")
+	}
+	return options
+}
+
 // input is how FFmpeg and ffprobe read a Source: as the file the server opened
 // and checked (sources.go), passed on as their first extra file, rather than by
 // a path that a link could lead elsewhere by then.
@@ -170,7 +205,7 @@ func readSource(ctx context.Context, src *os.File) (source, error) {
 	}
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-of", "json", "-show_entries",
-		"format=format_name,start_time,duration:stream=index,codec_type,codec_name,codec_long_name,codec_tag_string,profile,channels,bits_per_raw_sample,has_b_frames,color_transfer,start_time,avg_frame_rate,r_frame_rate:stream_disposition=default,attached_pic:stream_tags=language", input)
+		"format=format_name,start_time,duration:stream=index,codec_type,codec_name,codec_long_name,codec_tag_string,extradata_size,profile,channels,bits_per_raw_sample,has_b_frames,color_transfer,start_time,avg_frame_rate,r_frame_rate:stream_disposition=default,attached_pic:stream_tags=language", input)
 	cmd.ExtraFiles, cmd.Stdout = []*os.File{src}, &out
 	if err := runFFmpeg(cmd); err != nil {
 		return source{}, err
@@ -265,14 +300,8 @@ func streamSource(ctx context.Context, src *os.File, s source, from float64, w i
 	if from > 1 {
 		args = append(args, "-seek_timestamp", "1", "-ss", strconv.FormatFloat(from-1, 'f', -1, 64))
 	}
-	args = append(args, "-copyts", "-i", input, "-map", fmt.Sprint("0:", s.video.Index), "-map_chapters", "-1", "-c:v", "copy")
-	// HEVC from Matroska has no sample entry of its own, and MP4's default is
-	// hev1, which Safari won't play as a file. An MP4 Source's hev1 stays: its
-	// parameter sets may be in the stream alone, and retagged, its hvcC comes
-	// out empty (#11).
-	if s.video.Codec == "hevc" && s.video.Tag != "hev1" {
-		args = append(args, "-tag:v", "hvc1")
-	}
+	args = append(args, "-copyts", "-i", input, "-map", fmt.Sprint("0:", s.video.Index), "-map_chapters", "-1")
+	args = append(args, copyVideo(*s.video)...)
 	if s.audio != nil {
 		audio := audioArgs(*s.audio)
 		// WebKit's MediaSource stalls on FLAC deeper than 16 bits, which plays
@@ -300,11 +329,11 @@ func streamSource(ctx context.Context, src *os.File, s source, from float64, w i
 // HDR10 and Dolby Vision's base layer use, and HLG.
 var hdrTransfers = map[string]bool{"smpte2084": true, "arib-std-b67": true}
 
-// grabFrame makes a JPEG, 320 pixels wide, of the keyframe at or before the
+// grabFrame makes a JPEG, width pixels wide at most, of the keyframe at or before the
 // time at, in seconds of its own time, in the Source src. A keyframe decodes
 // alone, in a fraction of a second, where decoding up to the frame at at could
 // take 6 s (#11). HDR is tone-mapped to SDR, without which it looks flat.
-func grabFrame(ctx context.Context, src *os.File, at float64) ([]byte, error) {
+func grabFrame(ctx context.Context, src *os.File, at float64, width int) ([]byte, error) {
 	s, err := readSource(ctx, src)
 	if err != nil {
 		return nil, err
@@ -313,9 +342,9 @@ func grabFrame(ctx context.Context, src *os.File, at float64) ([]byte, error) {
 		return nil, errors.New("it has no video")
 	}
 	// In the shape it plays in.
-	filters := "scale=320:trunc(ow/dar/2)*2"
+	filters := fmt.Sprintf("scale=w='trunc(min(%d,iw*sar)/2)*2':h='trunc(ow/dar/2)*2'", width)
 	if hdrTransfers[s.video.Transfer] {
-		// After scaling, so the CPU tone-maps 320 pixels across. BT.2020 is
+		// After scaling, so the CPU tone-maps width pixels across. BT.2020 is
 		// set, which HDR always is, since zscale needs it and some files tag
 		// their transfer alone.
 		filters += ",setparams=color_primaries=bt2020:colorspace=bt2020nc:color_trc=" + s.video.Transfer +
@@ -346,52 +375,62 @@ func grabFrame(ctx context.Context, src *os.File, at float64) ([]byte, error) {
 type frames struct {
 	Keyframes []float64 `json:"keyframes"`
 	CleanEnds []float64 `json:"cleanEnds"`
+	// Where a copy that ends on the latest clean end stops (cutMoment): a
+	// decode time between the last packet it takes and the next, and when its
+	// frame stops showing, the next frame's time. +Inf where the Source ends.
+	decodeStop, frameEnd float64
 }
 
-// framesAround lists the frames of the Source src where a Moment can start and
+// framesAround lists the frames of the Source opened where a Moment can start and
 // end around the time at, in seconds of its own time: from the keyframe at or
-// before at, or else its first, through at. With B-frames, a copy ends cleanly
-// only where every frame decoded so far shows before every frame still to
-// come; without them, on every frame (#10). One ffprobe reads its packets from
-// a keyframe a second or more before at to 2 s past it, rather than an index
-// of the whole Source, which takes a minute (#11).
-func framesAround(ctx context.Context, src *os.File, at float64) (frames, error) {
-	s, err := readSource(ctx, src)
-	if err != nil {
-		return frames{}, err
+// before at, or else its first, through the time to. With B-frames, a copy
+// ends cleanly only where every frame decoded so far shows before every frame
+// still to come; without them, on every frame (#10), as on every frame of
+// video a Moment converts. One ffprobe reads its
+// packets from a keyframe a second or more before at to 2 s past to, rather
+// than an index of the whole Source, which takes a minute (#11).
+func framesAround(ctx context.Context, opened *os.File, at, to float64) (frames, error) {
+	probed, failure := readSource(ctx, opened)
+	if failure != nil {
+		return frames{}, failure
 	}
-	if s.video == nil {
+	if probed.video == nil {
 		return frames{}, errors.New("it has no video")
 	}
 	// Before the video starts, which can be seconds after the audio, nothing is
 	// read.
-	read := max(at, s.video.Start)
-	var out bytes.Buffer
+	read := max(at, probed.video.Start)
+	var output bytes.Buffer
 	// -read_intervals starts on the keyframe at or before its start, but on an
 	// MP4 by decode time, which lands a few frames late on a keyframe with
 	// leading frames (#11): hence a second early. Frames show at most half a
-	// second out of decode order (#10), so 2 s past at tells which are clean
-	// ends up to at.
-	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", fmt.Sprint(s.video.Index),
-		"-read_intervals", strconv.FormatFloat(read-1, 'f', -1, 64)+"%"+strconv.FormatFloat(read+2, 'f', -1, 64),
-		"-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", input)
-	cmd.ExtraFiles, cmd.Stdout = []*os.File{src}, &out
-	if err := runFFmpeg(cmd); err != nil {
-		return frames{}, err
+	// second out of decode order (#10), so 2 s past to tells which are clean
+	// ends up to to.
+	command := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", fmt.Sprint(probed.video.Index),
+		"-read_intervals", strconv.FormatFloat(read-1, 'f', -1, 64)+"%"+strconv.FormatFloat(max(read, to)+2, 'f', -1, 64),
+		"-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", input)
+	command.ExtraFiles, command.Stdout = []*os.File{opened}, &output
+	if failure := runFFmpeg(command); failure != nil {
+		return frames{}, failure
 	}
-	// When each packet shows, in decode order, from the first keyframe. An MP4
-	// cut mid-GOP has its edit list start after a keyframe, and ffprobe flags
-	// the packets before the start D: they never show, and nothing a Moment
-	// starts on comes before them.
-	var decoded, keyframes []float64
-	for line := range strings.FieldsSeq(out.String()) {
-		pts, flags, _ := strings.Cut(line, ",")
-		time, err := strconv.ParseFloat(pts, 64)
+	// When each packet shows, and when it's decoded, in decode order, from the
+	// first keyframe. An MP4 cut mid-GOP has its edit list start after a
+	// keyframe, and ffprobe flags the packets before the start D: they never
+	// show, and nothing a Moment starts on comes before them.
+	var decoded, decodedAt, keyframes []float64
+	for line := range strings.FieldsSeq(output.String()) {
+		pts, rest, _ := strings.Cut(line, ",")
+		dts, flags, _ := strings.Cut(rest, ",")
+		time, failure := strconv.ParseFloat(pts, 64)
 		key := strings.HasPrefix(flags, "K")
-		if err != nil || strings.Contains(flags, "D") || len(decoded) == 0 && !key {
+		if failure != nil || strings.Contains(flags, "D") || len(decoded) == 0 && !key {
 			continue // shows at no time, or can't be decoded
 		}
-		decoded = append(decoded, time)
+		decodedTime, failure := strconv.ParseFloat(dts, 64)
+		if failure != nil {
+			decodedTime = math.NaN() // which no copy ends by
+		}
+		decoded, decodedAt = append(decoded, time), append(decodedAt, decodedTime)
 		if key {
 			keyframes = append(keyframes, time)
 		}
@@ -400,28 +439,241 @@ func framesAround(ctx context.Context, src *os.File, at float64) (frames, error)
 		return frames{}, fmt.Errorf("FFmpeg found no keyframe around %v s", at)
 	}
 	from := keyframes[0]
-	for _, k := range keyframes {
-		if k <= at {
-			from = k
+	for _, keyframe := range keyframes {
+		if keyframe <= at {
+			from = keyframe
 		}
 	}
 	// The frame shown first of those decoded after each packet. Past the
 	// packets read, the Source has ended, or frames show over a second after
-	// at.
+	// to.
 	firstAfter := make([]float64, len(decoded))
 	for i, first := len(decoded)-1, math.Inf(1); i >= 0; i-- {
 		firstAfter[i], first = first, min(first, decoded[i])
 	}
-	f := frames{CleanEnds: []float64{}}
-	last := math.Inf(-1) // the frame shown last of those decoded so far
-	for i, shown := range decoded {
-		last = max(last, shown)
-		if from <= last && last <= at && last < firstAfter[i] {
-			f.CleanEnds = append(f.CleanEnds, last)
+	found := frames{CleanEnds: []float64{}}
+	if !untouched(*probed.video) {
+		shownOrder := slices.Sorted(slices.Values(decoded))
+		for index, shown := range shownOrder {
+			if from <= shown && shown <= to {
+				found.CleanEnds, found.decodeStop, found.frameEnd = append(found.CleanEnds, shown), math.Inf(1), math.Inf(1)
+				if index+1 < len(shownOrder) {
+					found.frameEnd = shownOrder[index+1]
+				}
+			}
+		}
+	} else {
+		last := math.Inf(-1) // the frame shown last of those decoded so far
+		for i, shown := range decoded {
+			last = max(last, shown)
+			if from <= last && last <= to && last < firstAfter[i] {
+				stop := math.Inf(1)
+				if i+1 < len(decoded) {
+					stop = (decodedAt[i] + decodedAt[i+1]) / 2
+				}
+				found.CleanEnds, found.decodeStop, found.frameEnd = append(found.CleanEnds, last), stop, firstAfter[i]
+			}
 		}
 	}
-	f.Keyframes = slices.DeleteFunc(keyframes, func(k float64) bool { return k < from || k > max(from, at) })
-	return f, nil
+	found.Keyframes = slices.DeleteFunc(keyframes, func(keyframe float64) bool { return keyframe < from || keyframe > max(from, to) })
+	return found, nil
+}
+
+// cutMoment writes to file the Moment of the Source opened, which ffprobe read
+// as probed, as a plain MP4 with its index first (#10): its video and the audio
+// track probed.audio, carried as streamSource carries them, from the keyframe at or
+// before start through the clean end at or before end, in seconds of the
+// Source's own time (#4, #14). It returns the keyframe's time.
+//
+// Of the Source's tags, only the audio's language comes along, so no title, no
+// encoder and no phone's location (#10). The Moment's own say when it was
+// saved, and where it came from (ADR-0002): the Source, named name, at path in
+// Home, the Moment's start, the end of its last frame, and its audio track,
+// counted from 0.
+func cutMoment(ctx context.Context, opened *os.File, probed source, name, path string, start, end float64, file string, progress func(percent int)) (key, lastFrame float64, failure error) {
+	if probed.video == nil {
+		return 0, 0, errors.New("it has no video")
+	}
+	first, failure := framesAround(ctx, opened, start, start)
+	if failure != nil {
+		return 0, 0, failure
+	}
+	last, failure := framesAround(ctx, opened, end, end)
+	if failure != nil {
+		return 0, 0, failure
+	}
+	key, lastIndex := first.Keyframes[0], len(last.CleanEnds)-1
+	if lastIndex < 0 || last.CleanEnds[lastIndex] < key {
+		return 0, 0, fmt.Errorf("it has no frame from %v s through %v s", start, end)
+	}
+	lastFrame = last.CleanEnds[lastIndex]
+	stop, frameEnd := last.decodeStop, last.frameEnd
+	if math.IsNaN(stop) {
+		return 0, 0, fmt.Errorf("FFmpeg can't tell when the frame at %v s is decoded", lastFrame)
+	}
+	if math.IsInf(frameEnd, 1) { // the Source's last frame, a frame long
+		frameEnd = lastFrame + probed.video.frameLength()
+	}
+	seconds := func(at float64) string { return strconv.FormatFloat(at, 'f', -1, 64) }
+	// Each input from the keyframe: aimed a millisecond into its frame, and as
+	// much later as -ss lands before its time (source.seekEarly), which
+	// -itsoffset takes off again, so that it lands at 0 (#4).
+	early := probed.seekEarly + 0.001
+	from := []string{"-seek_timestamp", "1", "-ss", seconds(key + early), "-itsoffset", seconds(early)}
+	// The video is read up to the first packet decoded after the end's frame:
+	// an input's -t counts by decode time, which B-frames put before a frame's
+	// own. The output's -t stops the sound at the first audio frame after the
+	// end's frame, by its own time; a -t for both would stop it as much early
+	// (#10).
+	args := slices.Concat([]string{"-nostdin", "-v", "error"}, from)
+	if !untouched(*probed.video) {
+		// Decoded from the keyframe itself, which an accurate seek to just past it would drop.
+		args = append([]string{"-vaapi_device", "/dev/dri/renderD128"}, append(args, "-noaccurate_seek")...)
+	}
+	if !math.IsInf(stop, 1) {
+		args = append(args, "-t", seconds(stop-key))
+	}
+	args = append(args, "-i", input)
+	streams := slices.Concat([]string{"-map", fmt.Sprint("0:", probed.video.Index), "-map_chapters", "-1"}, momentVideo(*probed.video))
+	// creation_time in FFmpeg's own form, to the microsecond.
+	tags := []string{"-map_metadata", "-1", "-metadata", "creation_time=" + time.Now().UTC().Format("2006-01-02T15:04:05.000000Z07:00"),
+		"-metadata", "moments.source_name=" + name, "-metadata", "moments.source_path=" + path, "-metadata", "moments.start=" + seconds(key)}
+	if probed.audio != nil {
+		args = slices.Concat(args, from, []string{"-i", input})
+		streams = slices.Concat(streams, []string{"-map", fmt.Sprint("1:", probed.audio.Index)}, audioArgs(*probed.audio))
+		tags = append(tags, "-metadata", "moments.audio_track="+strconv.Itoa(slices.IndexFunc(probed.tracks, func(track probedStream) bool { return track.Index == probed.audio.Index })))
+		if probed.audio.Tags.Language != "" {
+			tags = append(tags, "-metadata:s:a:0", "language="+probed.audio.Tags.Language)
+		}
+	}
+	// ponytail: a Moment through the Source's last frame has no end tag when
+	// ffprobe can't tell the frame rate; the Source's duration if one turns up.
+	if !math.IsInf(frameEnd, 1) {
+		streams = append(streams, "-t", seconds(frameEnd-key))
+		tags = append(tags, "-metadata", "moments.end="+seconds(frameEnd))
+	}
+	// A camera's timecode would come along as a track of its own. With
+	// use_metadata_tags, the MP4 holds tags under any key, rather than
+	// iTunes' few.
+	command := exec.CommandContext(ctx, "ffmpeg", slices.Concat(args, streams, tags, []string{"-write_tmcd", "0", "-strict", "unofficial", "-movflags", "+faststart+use_metadata_tags",
+		"-progress", "pipe:1", "-stats_period", "0.1", "-f", "mp4", "-y", "file:" + file})...)
+	length := frameEnd - key
+	if math.IsInf(length, 1) {
+		length = lastFrame - key
+	}
+	command.ExtraFiles, command.Stdout = []*os.File{opened}, &progressLines{length: length, report: progress}
+	if failure := runFFmpeg(command); failure != nil {
+		return 0, 0, failure
+	}
+	if probed.audio != nil && probed.audio.Codec == "flac" {
+		return key, lastFrame, unknownFLACFrameSizes(file)
+	}
+	return key, lastFrame, nil
+}
+
+// Apple's FLAC decoder fails on a frame larger than STREAMINFO says, which some releases understate.
+func unknownFLACFrameSizes(file string) (failure error) {
+	defer func() {
+		if recover() != nil {
+			failure = errors.New("the Moment's FLAC sample entry is cut short")
+		}
+	}()
+	moment, failure := os.OpenFile(file, os.O_RDWR, 0)
+	if failure != nil {
+		return failure
+	}
+	defer moment.Close()
+	header := make([]byte, 8)
+	for offset := int64(0); ; {
+		if _, failure := moment.ReadAt(header, offset); failure != nil {
+			return failure
+		}
+		size := int64(binary.BigEndian.Uint32(header))
+		if string(header[4:]) != "moov" {
+			offset += size
+			continue
+		}
+		moov := make([]byte, size)
+		if _, failure := moment.ReadAt(moov, offset); failure != nil {
+			return failure
+		}
+		for _, trak := range mp4Boxes(moov[8:]) {
+			if string(trak[4:8]) != "trak" {
+				continue
+			}
+			stsd := trak[8:]
+			for _, kind := range []string{"mdia", "minf", "stbl", "stsd"} {
+				stsd = mp4Box(stsd, kind)
+			}
+			if entry := mp4Boxes(stsd[8:])[0]; string(entry[4:8]) == "fLaC" {
+				streamInfo := mp4Box(entry[36:], "dfLa")[8:]
+				clear(streamInfo[4:10])
+			}
+		}
+		_, failure = moment.WriteAt(moov, offset)
+		return failure
+	}
+}
+
+type progressLines struct {
+	length      float64
+	report      func(percent int)
+	partialLine []byte
+}
+
+func (lines *progressLines) Write(chunk []byte) (int, error) {
+	lines.partialLine = append(lines.partialLine, chunk...)
+	for {
+		line, rest, whole := bytes.Cut(lines.partialLine, []byte("\n"))
+		if !whole {
+			return len(chunk), nil
+		}
+		lines.partialLine = rest
+		written, isTime := bytes.CutPrefix(line, []byte("out_time_us="))
+		if microseconds, err := strconv.ParseFloat(string(written), 64); isTime && err == nil && lines.length > 0 {
+			lines.report(int(min(max(microseconds/1e6/lines.length, 0), 1) * 100))
+		}
+	}
+}
+
+func checkMoment(ctx context.Context, file string, lastFrame, frameLength float64) error {
+	var output bytes.Buffer
+	command := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "V:0",
+		"-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", "file:"+file)
+	command.Stdout = &output
+	if err := runFFmpeg(command); err != nil {
+		return err
+	}
+	packets := strings.Fields(output.String())
+	if len(packets) == 0 {
+		return errors.New("it has no video")
+	}
+	lastShown := math.Inf(-1)
+	for index, packet := range packets {
+		pts, flags, _ := strings.Cut(packet, ",")
+		time, err := strconv.ParseFloat(pts, 64)
+		if index == 0 && !strings.HasPrefix(flags, "K") {
+			return errors.New("starts on a frame that isn't a keyframe")
+		}
+		if index == 0 && (err != nil || math.Abs(time) > 0.001) {
+			return fmt.Errorf("starts at %s s, not 0", pts)
+		}
+		if err == nil && !strings.Contains(flags, "D") {
+			lastShown = max(lastShown, time)
+		}
+	}
+	framesOff := int(math.Round((lastShown - lastFrame) / frameLength))
+	frames := "frames"
+	if framesOff == 1 || framesOff == -1 {
+		frames = "frame"
+	}
+	switch {
+	case framesOff > 0:
+		return fmt.Errorf("ends %d %s after the mark", framesOff, frames)
+	case framesOff < 0:
+		return fmt.Errorf("ends %d %s before the mark", -framesOff, frames)
+	}
+	return nil
 }
 
 // untilMoov keeps the start of a stream written to it, and calls stop once
@@ -552,12 +804,12 @@ func fraction(s string) float64 {
 }
 
 // runFFmpeg runs cmd, FFmpeg or ffprobe, with what it said on stderr in its
-// error.
+// error, from a line of its own: a failed Save shows the error's last line.
 func runFFmpeg(cmd *exec.Cmd) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w: %s", cmd.Args[0], err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("%s: %w:\n%s", cmd.Args[0], err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
