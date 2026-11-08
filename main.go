@@ -290,6 +290,21 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Write(jpeg)
 	})
+	mux.HandleFunc("GET /api/moments/{title}/file", func(writer http.ResponseWriter, request *http.Request) {
+		file, openError := openMoment(home, request.PathValue("title"))
+		if openError != nil {
+			http.Error(writer, openError.Error(), http.StatusNotFound)
+			return
+		}
+		defer file.Close()
+		info, statError := file.Stat()
+		if statError != nil {
+			http.Error(writer, statError.Error(), http.StatusInternalServerError)
+			return
+		}
+		writer.Header().Set("Content-Type", "video/mp4")
+		http.ServeContent(writer, request, info.Name(), info.ModTime(), file)
+	})
 	mux.HandleFunc("GET /api/mounts", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(mounts(home.Name()))

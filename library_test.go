@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -196,6 +197,61 @@ func TestAMomentRenamedInFilesKeepsItsPoster(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusNotFound {
 		t.Errorf("the poster of the old title answers %s, want 404 Not Found", res.Status)
+	}
+}
+
+func TestAMomentsFileAnswersRangeAndIfRangeRequests(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	title := "Clip · 0:12"
+	file := filepath.Join(home, "Moments", title+".mp4")
+	clip(t, file, "-t", "1", "-c:v", "libx264", "-c:a", "aac")
+	whole := readFile(t, file)
+	server := serve(t, home)
+	fetchFile := func(title string, headers map[string]string) (*http.Response, []byte) {
+		t.Helper()
+		request, requestError := http.NewRequest(http.MethodGet, server.URL+"/api/moments/"+url.PathEscape(title)+"/file", nil)
+		if requestError != nil {
+			t.Fatal(requestError)
+		}
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+		response, responseError := http.DefaultClient.Do(request)
+		if responseError != nil {
+			t.Fatal(responseError)
+		}
+		defer response.Body.Close()
+		body, readError := io.ReadAll(response.Body)
+		if readError != nil {
+			t.Fatal(readError)
+		}
+		return response, body
+	}
+
+	response, body := fetchFile(title, nil)
+	if response.StatusCode != http.StatusOK || !bytes.Equal(body, whole) || response.Header.Get("Content-Type") != "video/mp4" || response.Header.Get("Accept-Ranges") != "bytes" {
+		t.Fatalf("the file answers %s, %s, Accept-Ranges %q, %d of %d bytes, want 200 OK, video/mp4, bytes, the whole file",
+			response.Status, response.Header.Get("Content-Type"), response.Header.Get("Accept-Ranges"), len(body), len(whole))
+	}
+	lastModified := response.Header.Get("Last-Modified")
+
+	response, body = fetchFile(title, map[string]string{"Range": "bytes=100-199"})
+	if want := fmt.Sprintf("bytes 100-199/%d", len(whole)); response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") != want || !bytes.Equal(body, whole[100:200]) {
+		t.Errorf("a Range answers %s, %q, %d bytes, want 206 Partial Content, %q, bytes 100 to 199", response.Status, response.Header.Get("Content-Range"), len(body), want)
+	}
+
+	response, body = fetchFile(title, map[string]string{"Range": "bytes=100-199", "If-Range": lastModified})
+	if response.StatusCode != http.StatusPartialContent || !bytes.Equal(body, whole[100:200]) {
+		t.Errorf("a Range If-Range the file's Last-Modified answers %s, %d bytes, want 206 Partial Content, bytes 100 to 199", response.Status, len(body))
+	}
+
+	response, body = fetchFile(title, map[string]string{"Range": "bytes=100-199", "If-Range": "Thu, 01 Jan 2004 00:00:00 GMT"})
+	if response.StatusCode != http.StatusOK || !bytes.Equal(body, whole) {
+		t.Errorf("a Range If-Range an older date answers %s, %d bytes, want 200 OK, the whole file", response.Status, len(body))
+	}
+
+	if missing, _ := fetchFile("Missing", nil); missing.StatusCode != http.StatusNotFound {
+		t.Errorf("a missing Moment's file answers %s, want 404 Not Found", missing.Status)
 	}
 }
 

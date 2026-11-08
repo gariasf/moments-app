@@ -1,6 +1,8 @@
 import { Clapperboard, Scissors } from "lucide-react";
 import { useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "@/components/ui/button";
+import { MomentPlayer } from "./MomentPlayer";
 import { getJSON } from "./player";
 import { Trimmer } from "./Trimmer";
 
@@ -24,6 +26,7 @@ type Moment = {
 function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 	const [moments, setMoments] = useState<Moment[]>();
 	const [error, setError] = useState("");
+	const [playing, setPlaying] = useState<string>();
 
 	useEffect(() => {
 		const abort = new AbortController();
@@ -54,7 +57,12 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 				<ul className="grid grid-cols-2 gap-x-3 gap-y-4 px-4 pb-6 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
 					{moments?.map((moment) => (
 						<li key={moment.title} className="flex min-w-0 flex-col gap-1.5">
-							<div className="relative aspect-video overflow-hidden rounded-lg bg-black">
+							<button
+								type="button"
+								aria-label={`Play ${moment.title}`}
+								onClick={() => flushSync(() => setPlaying(moment.title))}
+								className="relative aspect-video overflow-hidden rounded-lg bg-black outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+							>
 								<img
 									src={`/api/moments/${encodeURIComponent(moment.title)}/poster`}
 									alt=""
@@ -67,7 +75,7 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 								<span className="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 font-medium text-white text-xs tabular-nums">
 									{formatLength(moment.length)}
 								</span>
-							</div>
+							</button>
 							<div className="min-w-0">
 								<p className="line-clamp-2 break-words font-medium text-sm">
 									{moment.title}
@@ -81,6 +89,9 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 						</li>
 					))}
 				</ul>
+			)}
+			{playing && (
+				<MomentPlayer title={playing} onClose={() => setPlaying(undefined)} />
 			)}
 		</>
 	);

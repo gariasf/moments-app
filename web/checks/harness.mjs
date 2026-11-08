@@ -73,7 +73,7 @@ export async function runPage(page, media, api, limitS = LIMIT_S) {
 			return res.writeHead(204).end();
 		}
 		if (api && pathname.startsWith("/api/"))
-			return proxy(res, new URL(req.url, api));
+			return proxy(req, res, new URL(req.url, api));
 		if (pathname.startsWith("/src/") && pathname.endsWith(".ts"))
 			return serveModule(res, join(import.meta.dirname, "..", pathname));
 		const inMedia = pathname.startsWith("/media/");
@@ -133,17 +133,24 @@ function serve(req, res, path) {
 
 // The Moments server's answer at url, passed on as it streams. A page that reads slowly holds
 // the server back, and one that closes closes it.
-async function proxy(res, url) {
+async function proxy(request, response, url) {
 	const closed = new AbortController();
-	res.on("close", () => closed.abort());
+	response.on("close", () => closed.abort());
 	try {
-		const answer = await fetch(url, { signal: closed.signal });
-		res.writeHead(answer.status, {
-			"Content-Type": answer.headers.get("Content-Type") ?? "text/plain",
+		const answer = await fetch(url, {
+			signal: closed.signal,
+			headers: request.headers.range ? { Range: request.headers.range } : {},
 		});
-		await pipeline(Readable.fromWeb(answer.body), res);
+		const headers = {
+			"Content-Type": answer.headers.get("Content-Type") ?? "text/plain",
+		};
+		for (const name of ["Accept-Ranges", "Content-Range", "Content-Length"]) {
+			if (answer.headers.has(name)) headers[name] = answer.headers.get(name);
+		}
+		response.writeHead(answer.status, headers);
+		await pipeline(Readable.fromWeb(answer.body), response);
 	} catch {
-		res.destroy();
+		response.destroy();
 	}
 }
 

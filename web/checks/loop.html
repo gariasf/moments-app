@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>Loop check</title>
+		<link rel="icon" href="data:," />
+		<style>
+			video {
+				width: 320px;
+			}
+		</style>
+		<script>
+			function post(body) {
+				const engine = new URLSearchParams(location.search).get("engine");
+				return fetch(`/results?engine=${engine}`, { method: "POST", body: JSON.stringify(body) });
+			}
+			addEventListener("error", (event) => post({ error: `the page threw ${event.message}` }));
+			addEventListener("unhandledrejection", (event) => post({ error: `the page threw ${event.reason}` }));
+		</script>
+	</head>
+	<body>
+		<p id="status"></p>
+		<div id="stage"></div>
+		<script type="module">
+			const params = new URLSearchParams(location.search);
+			const loops = Number(params.get("loops"));
+			const status = document.getElementById("status");
+			const stage = document.getElementById("stage");
+			const canvas = document.createElement("canvas");
+			canvas.width = 64;
+			canvas.height = 36;
+			const context = canvas.getContext("2d", { willReadFrequently: true });
+
+			function image(video) {
+				context.drawImage(video, 0, 0, canvas.width, canvas.height);
+				return context.getImageData(0, 0, canvas.width, canvas.height).data;
+			}
+
+			function difference(first, second) {
+				let total = 0;
+				for (let i = 0; i < first.length; i += 4) {
+					for (let channel = 0; channel < 3; channel++) total += Math.abs(first[i + channel] - second[i + channel]);
+				}
+				return total / ((first.length / 4) * 3);
+			}
+
+			function watch(title, timeoutMs) {
+				status.textContent = `Looping ${title}, muted`;
+				const video = document.createElement("video");
+				video.muted = true;
+				video.loop = true;
+				video.playsInline = true;
+				video.src = `/api/moments/${encodeURIComponent(title)}/file`;
+				stage.replaceChildren(video);
+				const wraps = [];
+				const gaps = [];
+				let first;
+				let previous;
+				return new Promise((resolve) => {
+					let handle;
+					const finish = (error) => {
+						video.cancelVideoFrameCallback(handle);
+						clearTimeout(timer);
+						video.removeAttribute("src");
+						video.load();
+						resolve({ title, error, firstTimeS: first?.timeS, frameMs: median(gaps), wraps });
+					};
+					const timer = setTimeout(() => finish(`${wraps.length} of ${loops} passes in ${timeoutMs} ms`), timeoutMs);
+					const onFrame = (now, { mediaTime }) => {
+						if (!first) first = { timeS: mediaTime, image: image(video) };
+						else if (mediaTime < previous.timeS) {
+							wraps.push({
+								seamMs: Math.round(now - previous.now),
+								restartTimeS: mediaTime,
+								difference: Number(difference(image(video), first.image).toFixed(2)),
+							});
+							if (wraps.length === loops) return finish();
+						} else gaps.push(now - previous.now);
+						previous = { timeS: mediaTime, now };
+						handle = video.requestVideoFrameCallback(onFrame);
+					};
+					handle = video.requestVideoFrameCallback(onFrame);
+					video.addEventListener("error", () => finish(`MediaError ${video.error.code}: ${video.error.message}`));
+					video.play().catch((exception) => finish(`${exception.name}: ${exception.message}`));
+				});
+			}
+
+			function median(values) {
+				const sorted = values.toSorted((first, second) => first - second);
+				return sorted.length ? Math.round(sorted[Math.floor(sorted.length / 2)]) : undefined;
+			}
+
+			const results = [];
+			for (const title of params.get("titles").split(",")) {
+				results.push(await watch(title, Number(params.get("timeoutMs"))));
+			}
+			status.textContent = "Done";
+			await post({ results });
+		</script>
+	</body>
+</html>

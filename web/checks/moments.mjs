@@ -1,5 +1,6 @@
 // The Moments check (#39): through a host run (umbrel/host-run.sh), a Moment saved from every Source
-// in the test set decodes as a plain file in WebKit and in headless Chrome on the Mac, muted. A pass
+// in the test set decodes as a plain file in WebKit and in headless Chrome on the Mac, muted, then
+// loops from its first frame as the server serves it (#42), the seam of each muted pass reported. A pass
 // names the Sources by their traits only, so it can go in a PR; their paths stay out of the repo (#22).
 // usage: node web/checks/moments.mjs <the URL umbrel/host-run.sh start prints>
 import { execFileSync } from "node:child_process";
@@ -13,6 +14,9 @@ const AT_SHARE = 0.45; // of the Source, where the Moment starts, past any openi
 const LENGTH_S = 3;
 const SAVES_S = 300; // for every Save to end
 const PREFIX = "moments-check-"; // of the Moments' titles, so the run's other Moments stay
+const LOOPS = 3;
+const RESTART_S = 0.001;
+const RESTART_DIFFERENCE = 2; // mean per channel, of 255, between a pass's first frame and the Moment's
 
 const url = process.argv[2];
 if (!url) {
@@ -105,14 +109,26 @@ try {
 				30 + 10 * made.length,
 			)
 		: {};
-	for (const [engine, { error, log }] of Object.entries(engines)) {
+	const loopTimeoutMs = (LENGTH_S * LOOPS + 15) * 1000;
+	const looped = made.length
+		? await runPage(
+				`loop.html?loops=${LOOPS}&timeoutMs=${loopTimeoutMs}&titles=${made.map(({ title }) => encodeURIComponent(title)).join(",")}`,
+				local,
+				url,
+				30 + (loopTimeoutMs / 1000) * made.length,
+			)
+		: {};
+	for (const [engine, { error, log }] of [
+		...Object.entries(engines),
+		...Object.entries(looped).map(([engine, run]) => [`${engine} loop`, run]),
+	]) {
 		if (error)
 			problems.push(
 				`${engine}: ${error}`,
 				...log.slice(-10).map((line) => `  ${line}`),
 			);
 	}
-	for (const { traits, file } of made) {
+	for (const { traits, file, title } of made) {
 		const cells = Object.entries(engines).map(([engine, { results = [] }]) => {
 			const seen = results.find((result) => result.file === file);
 			if (seen?.verdict !== "plays")
@@ -128,7 +144,28 @@ try {
 			problems.push(
 				`${traits}: the Moment lost its Dolby Vision 8 configuration: ${carried}`,
 			);
-		console.log(`${traits}: ${carried}\n  ${cells.join(" · ")}`);
+		const seams = Object.entries(looped).map(([engine, { results = [] }]) => {
+			const loop = results.find((result) => result.title === title);
+			if (!loop || loop.error) {
+				problems.push(
+					`${engine}, ${traits}: no loop: ${loop?.error ?? "no result"}`,
+				);
+				return `${engine} -`;
+			}
+			const late = loop.wraps.filter(
+				({ restartTimeS, difference }) =>
+					Math.abs(restartTimeS - loop.firstTimeS) > RESTART_S ||
+					difference > RESTART_DIFFERENCE,
+			);
+			if (late.length)
+				problems.push(
+					`${engine}, ${traits}: a pass restarts past frame 0: ${JSON.stringify(late)} from ${loop.firstTimeS} s`,
+				);
+			return `${engine} ${loop.wraps.map(({ seamMs }) => seamMs).join("/")} (frames ${loop.frameMs})`;
+		});
+		console.log(
+			`${traits}: ${carried}\n  ${cells.join(" · ")} · loop seams, ms: ${seams.join(" · ")}`,
+		);
 	}
 } finally {
 	rmSync(local, { recursive: true, force: true });
@@ -138,6 +175,6 @@ if (problems.length) {
 	process.exitCode = 1;
 } else {
 	console.log(
-		`pass: a Moment from each of the ${made.length} test-set Sources decodes in both engines`,
+		`pass: a Moment from each of the ${made.length} test-set Sources decodes in both engines, and loops from frame 0`,
 	);
 }
