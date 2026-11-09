@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -58,132 +60,146 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 	ui, _ := fs.Sub(dist, "web/dist") // errors only on an invalid path
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServerFS(ui))
-	// ?path= lists a folder, "" being Home; ?q= searches all of Home instead.
-	mux.HandleFunc("GET /api/sources", func(w http.ResponseWriter, r *http.Request) {
-		var l listing
-		var err error
-		if q := r.URL.Query().Get("q"); strings.TrimSpace(q) != "" {
-			l = searchVideos(home.FS(), q)
-		} else {
-			l, err = listFolder(home.FS(), r.URL.Query().Get("path"))
+	// ?path= lists a folder, "" being Home and "Uploads" Uploads; ?q= searches
+	// both instead.
+	mux.HandleFunc("GET /api/sources", func(writer http.ResponseWriter, request *http.Request) {
+		var listed listing
+		var listError error
+		query, folderPath := request.URL.Query().Get("q"), request.URL.Query().Get("path")
+		switch {
+		case strings.TrimSpace(query) != "":
+			listed = searchVideos(home.FS(), query)
+			uploaded, _ := listUploads(data, query)
+			listed.Videos = append(listed.Videos, uploaded.Videos...)
+		case folderPath == "Uploads":
+			listed, listError = listUploads(data, "")
+		default:
+			listed, listError = listFolder(home.FS(), folderPath)
 		}
-		if err != nil {
+		if listError != nil {
 			// Outside Home, hidden or missing alike, so nothing outside is confirmed to exist.
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(writer, listError.Error(), http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(l)
+		for index := range listed.Videos {
+			listed.Videos[index].Deletable = deletable(home, data, listed.Videos[index].Path)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(listed)
 	})
 	// How the Trimmer opens the Source at ?path=, and its stream from the time
 	// ?from=, in seconds of the Source's own time, with the audio track ?audio=,
 	// counted from 0 in the probe's list, else the default (media.go).
-	mux.HandleFunc("GET /api/source", func(w http.ResponseWriter, r *http.Request) {
-		src, err := sourceFile(home, r.URL.Query().Get("path"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+	mux.HandleFunc("GET /api/source", func(writer http.ResponseWriter, request *http.Request) {
+		source, failure := sourceFile(home, data, request.URL.Query().Get("path"))
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusNotFound)
 			return
 		}
-		defer src.Close()
-		p, err := probeSource(r.Context(), src)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		defer source.Close()
+		probed, failure := probeSource(request.Context(), source)
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(p)
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(probed)
 	})
-	mux.HandleFunc("GET /api/source/stream", func(w http.ResponseWriter, r *http.Request) {
-		from, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("from"), "0"), 64)
-		if err != nil || math.IsNaN(from) || math.IsInf(from, 0) {
-			http.Error(w, "from isn't a time in seconds", http.StatusBadRequest)
+	mux.HandleFunc("GET /api/source/stream", func(writer http.ResponseWriter, request *http.Request) {
+		from, failure := strconv.ParseFloat(cmp.Or(request.URL.Query().Get("from"), "0"), 64)
+		if failure != nil || math.IsNaN(from) || math.IsInf(from, 0) {
+			http.Error(writer, "from isn't a time in seconds", http.StatusBadRequest)
 			return
 		}
-		src, err := sourceFile(home, r.URL.Query().Get("path"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		source, failure := sourceFile(home, data, request.URL.Query().Get("path"))
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusNotFound)
 			return
 		}
-		defer src.Close()
-		s, err := readSource(r.Context(), src)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		defer source.Close()
+		probed, failure := readSource(request.Context(), source)
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
-		if why := s.cantPlay(); why != "" {
-			http.Error(w, "The Trimmer can't play this Source: "+why+".", http.StatusUnprocessableEntity)
+		if why := probed.cantPlay(); why != "" {
+			http.Error(writer, "The Trimmer can't play this Source: "+why+".", http.StatusUnprocessableEntity)
 			return
 		}
-		if audio := r.URL.Query().Get("audio"); audio != "" {
-			n, err := strconv.Atoi(audio)
-			if err != nil || n < 0 || n >= len(s.tracks) {
-				http.Error(w, "audio isn't one of the Source's audio tracks", http.StatusBadRequest)
+		if audio := request.URL.Query().Get("audio"); audio != "" {
+			track, failure := strconv.Atoi(audio)
+			if failure != nil || track < 0 || track >= len(probed.tracks) {
+				http.Error(writer, "audio isn't one of the Source's audio tracks", http.StatusBadRequest)
 				return
 			}
-			s.audio = &s.tracks[n]
+			probed.audio = &probed.tracks[track]
 		}
-		if err := streamSource(r.Context(), src, s, from, &typedStream{ResponseWriter: w}); err != nil {
-			slog.Error("stream failed", "path", r.URL.Query().Get("path"), "err", err)
+		if failure := streamSource(request.Context(), source, probed, from, &typedStream{ResponseWriter: writer}); failure != nil {
+			slog.Error("stream failed", "path", request.URL.Query().Get("path"), "err", failure)
 		}
 	})
 	// A thumbnail of the Source at ?path= for the time ?at=, in seconds of its
 	// own time (media.go), cached in app data.
-	mux.HandleFunc("GET /api/source/thumbnail", func(w http.ResponseWriter, r *http.Request) {
-		at, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("at"), "0"), 64)
-		if err != nil || math.IsNaN(at) || math.IsInf(at, 0) {
-			http.Error(w, "at isn't a time in seconds", http.StatusBadRequest)
+	mux.HandleFunc("GET /api/source/thumbnail", func(writer http.ResponseWriter, request *http.Request) {
+		at, failure := strconv.ParseFloat(cmp.Or(request.URL.Query().Get("at"), "0"), 64)
+		if failure != nil || math.IsNaN(at) || math.IsInf(at, 0) {
+			http.Error(writer, "at isn't a time in seconds", http.StatusBadRequest)
 			return
 		}
-		src, err := sourceFile(home, r.URL.Query().Get("path"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		source, failure := sourceFile(home, data, request.URL.Query().Get("path"))
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusNotFound)
 			return
 		}
-		defer src.Close()
-		info, err := src.Stat()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		defer source.Close()
+		info, failure := source.Stat()
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
 		// Named after the Source's path, size and modification time too, so a
 		// Source replaced in place gets thumbnails of its own.
-		name := fmt.Sprintf("thumbnails/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%q %d %d %g", src.Name(), info.Size(), info.ModTime().UnixNano(), at)))
-		jpeg, err := cached(data, name, func() ([]byte, error) { return grabFrame(r.Context(), src, at, 320) })
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		name := fmt.Sprintf("thumbnails/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%q %d %d %g", source.Name(), info.Size(), info.ModTime().UnixNano(), at)))
+		jpeg, failure := cached(data, name, func() ([]byte, error) { return grabFrame(request.Context(), source, at, 320) })
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(jpeg)
+		writer.Header().Set("Content-Type", "image/jpeg")
+		writer.Write(jpeg)
 	})
 	// Where a Moment of the Source at ?path= can start and end around the time
 	// ?at=, through the time ?to= when given, in seconds of its own time
 	// (media.go): what the Trimmer's marks snap and nudge to.
-	mux.HandleFunc("GET /api/source/frames", func(w http.ResponseWriter, r *http.Request) {
-		at, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("at"), "0"), 64)
-		if err != nil || math.IsNaN(at) || math.IsInf(at, 0) {
-			http.Error(w, "at isn't a time in seconds", http.StatusBadRequest)
+	mux.HandleFunc("GET /api/source/frames", func(writer http.ResponseWriter, request *http.Request) {
+		at, failure := strconv.ParseFloat(cmp.Or(request.URL.Query().Get("at"), "0"), 64)
+		if failure != nil || math.IsNaN(at) || math.IsInf(at, 0) {
+			http.Error(writer, "at isn't a time in seconds", http.StatusBadRequest)
 			return
 		}
-		to, err := strconv.ParseFloat(cmp.Or(r.URL.Query().Get("to"), r.URL.Query().Get("at"), "0"), 64)
-		if err != nil || math.IsNaN(to) || math.IsInf(to, 0) {
-			http.Error(w, "to isn't a time in seconds", http.StatusBadRequest)
+		to, failure := strconv.ParseFloat(cmp.Or(request.URL.Query().Get("to"), request.URL.Query().Get("at"), "0"), 64)
+		if failure != nil || math.IsNaN(to) || math.IsInf(to, 0) {
+			http.Error(writer, "to isn't a time in seconds", http.StatusBadRequest)
 			return
 		}
-		src, err := sourceFile(home, r.URL.Query().Get("path"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		source, failure := sourceFile(home, data, request.URL.Query().Get("path"))
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusNotFound)
 			return
 		}
-		defer src.Close()
-		f, err := framesAround(r.Context(), src, at, to)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		defer source.Close()
+		frames, failure := framesAround(request.Context(), source, at, to)
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(f)
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(frames)
 	})
+	if makeError := os.MkdirAll(filepath.Join(data, "uploads"), 0o755); makeError != nil {
+		return nil, makeError
+	}
+	removeHalfWritten(filepath.Join(data, "uploads"), ".uploading-")
 	// Saves the Moment of the Source at path from start to end, in seconds of
 	// its own time, with the audio track audio, counted from 0 in the probe's
 	// list, else the default, under title (saves.go). It answers at once: the
@@ -192,38 +208,46 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	mux.HandleFunc("POST /api/saves", func(w http.ResponseWriter, r *http.Request) {
-		var s save
-		if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
-			http.Error(w, "the Save isn't JSON: "+err.Error(), http.StatusBadRequest)
+	mux.HandleFunc("POST /api/saves", func(writer http.ResponseWriter, request *http.Request) {
+		var planned save
+		if failure := json.NewDecoder(request.Body).Decode(&planned); failure != nil {
+			http.Error(writer, "the Save isn't JSON: "+failure.Error(), http.StatusBadRequest)
 			return
 		}
-		if s.End < s.Start {
-			http.Error(w, "the Save ends before it starts", http.StatusBadRequest)
+		if planned.End < planned.Start {
+			http.Error(writer, "the Save ends before it starts", http.StatusBadRequest)
 			return
 		}
-		src, err := sourceFile(home, s.Path)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+		source, failure := sourceFile(home, data, planned.Path)
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusNotFound)
 			return
 		}
-		defer src.Close()
-		m, err := readSource(r.Context(), src)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		defer source.Close()
+		probed, failure := readSource(request.Context(), source)
+		if failure != nil {
+			http.Error(writer, failure.Error(), http.StatusInternalServerError)
 			return
 		}
-		if s.Audio != nil && (*s.Audio < 0 || *s.Audio >= len(m.tracks)) {
-			http.Error(w, "audio isn't one of the Source's audio tracks", http.StatusBadRequest)
+		if planned.Audio != nil && (*planned.Audio < 0 || *planned.Audio >= len(probed.tracks)) {
+			http.Error(writer, "audio isn't one of the Source's audio tracks", http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(saves.add(s))
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(writer).Encode(saves.add(planned))
 	})
 	mux.HandleFunc("GET /api/saves", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(saves.all())
+		type namedSave struct {
+			save
+			SourceName string `json:"sourceName"`
+		}
+		listed := []namedSave{}
+		for _, each := range saves.all() {
+			listed = append(listed, namedSave{each, sourceName(home.FS(), each.Path)})
+		}
+		json.NewEncoder(w).Encode(listed)
 	})
 	refuse := func(w http.ResponseWriter, err error) {
 		status := http.StatusBadRequest
@@ -259,6 +283,50 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// Receives the upload of a video named ?name= as the request's body, into
+	// Uploads.
+	mux.HandleFunc("POST /api/uploads", func(writer http.ResponseWriter, request *http.Request) {
+		name := request.URL.Query().Get("name")
+		if !uploadable(name) {
+			http.Error(writer, "Moments uploads only videos, under a file name", http.StatusBadRequest)
+			return
+		}
+		uploaded, uploadError := receiveUpload(data, name, request.Body)
+		if uploadError != nil {
+			slog.Error("upload failed", "name", name, "err", uploadError)
+			http.Error(writer, uploadError.Error(), http.StatusInternalServerError)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusCreated)
+		json.NewEncoder(writer).Encode(uploaded)
+	})
+	mux.HandleFunc("DELETE /api/sources", func(writer http.ResponseWriter, request *http.Request) {
+		sourcePath := request.URL.Query().Get("path")
+		root, inside, source, checkError := checkDeletable(home, data, sourcePath)
+		if checkError != nil {
+			status := notFoundOrServerError(checkError)
+			if errors.Is(checkError, errNotDeletable) {
+				status = http.StatusForbidden
+			}
+			http.Error(writer, checkError.Error(), status)
+			return
+		}
+		defer root.Close()
+		isSource := func(savePath string) bool {
+			saved, statError := home.Stat(savePath)
+			return path.Clean(savePath) == sourcePath || statError == nil && os.SameFile(source, saved)
+		}
+		removeError := saves.unlessNeeded(isSource, func() error { return root.Remove(inside) })
+		switch {
+		case removeError == nil:
+			writer.WriteHeader(http.StatusNoContent)
+		case errors.Is(removeError, errSourceNeeded):
+			http.Error(writer, removeError.Error(), http.StatusConflict)
+		default:
+			http.Error(writer, removeError.Error(), notFoundOrServerError(removeError))
+		}
+	})
 	mux.HandleFunc("GET /api/moments", func(w http.ResponseWriter, r *http.Request) {
 		library, err := listLibrary(r.Context(), home, data)
 		if err != nil {
@@ -268,27 +336,25 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(library)
 	})
-	mux.HandleFunc("GET /api/moments/{title}/poster", func(w http.ResponseWriter, r *http.Request) {
-		file, err := openMoment(home, r.PathValue("title"))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+	mux.HandleFunc("GET /api/moments/{title}/poster", func(writer http.ResponseWriter, request *http.Request) {
+		file, openError := openMoment(home, request.PathValue("title"))
+		if openError != nil {
+			http.Error(writer, openError.Error(), http.StatusNotFound)
 			return
 		}
 		defer file.Close()
-		info, err := file.Stat()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		info, statError := file.Stat()
+		if statError != nil {
+			http.Error(writer, statError.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Without the file's name, so a Moment renamed in Files keeps its poster.
-		name := fmt.Sprintf("posters/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%d %d", info.Size(), info.ModTime().UnixNano())))
-		jpeg, err := cached(data, name, func() ([]byte, error) { return grabFrame(r.Context(), file, 0, 640) })
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		jpeg, grabError := cached(data, posterName(info), func() ([]byte, error) { return grabFrame(request.Context(), file, 0, 640) })
+		if grabError != nil {
+			http.Error(writer, grabError.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Write(jpeg)
+		writer.Header().Set("Content-Type", "image/jpeg")
+		writer.Write(jpeg)
 	})
 	mux.HandleFunc("GET /api/moments/{title}/file", func(writer http.ResponseWriter, request *http.Request) {
 		file, openError := openMoment(home, request.PathValue("title"))
@@ -303,13 +369,44 @@ func newHandler(home *os.Root, data string) (http.Handler, error) {
 			return
 		}
 		writer.Header().Set("Content-Type", "video/mp4")
+		if request.URL.Query().Has("download") {
+			writer.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": request.PathValue("title") + ".mp4"}))
+		}
 		http.ServeContent(writer, request, info.Name(), info.ModTime(), file)
+	})
+	mux.HandleFunc("PATCH /api/moments/{title}", func(writer http.ResponseWriter, request *http.Request) {
+		var asked struct{ Title string }
+		if decodeError := json.NewDecoder(request.Body).Decode(&asked); decodeError != nil {
+			http.Error(writer, "the rename isn't JSON: "+decodeError.Error(), http.StatusBadRequest)
+			return
+		}
+		title, renameError := renameMoment(request.Context(), home, request.PathValue("title"), asked.Title)
+		if renameError != nil {
+			http.Error(writer, renameError.Error(), notFoundOrServerError(renameError))
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(moment{Title: title})
+	})
+	mux.HandleFunc("DELETE /api/moments/{title}", func(writer http.ResponseWriter, request *http.Request) {
+		if deleteError := deleteMoment(home, data, request.PathValue("title")); deleteError != nil {
+			http.Error(writer, deleteError.Error(), notFoundOrServerError(deleteError))
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /api/mounts", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(mounts(home.Name()))
 	})
 	return mux, nil
+}
+
+func notFoundOrServerError(failure error) int {
+	if errors.Is(failure, fs.ErrNotExist) {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
 }
 
 // typedStream passes a stream on to the page with, as its Content-Type, the

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -78,16 +80,71 @@ func isMoment(entry fs.DirEntry) bool {
 }
 
 func openMoment(home *os.Root, title string) (*os.File, error) {
-	entries, err := fs.ReadDir(home.FS(), "Moments")
-	if err != nil {
-		return nil, err
+	path, findError := findMoment(home, title)
+	if findError != nil {
+		return nil, findError
+	}
+	return home.Open(path)
+}
+
+func findMoment(home *os.Root, title string) (string, error) {
+	entries, readError := fs.ReadDir(home.FS(), "Moments")
+	if readError != nil {
+		return "", readError
 	}
 	for _, entry := range entries {
 		if name := entry.Name(); isMoment(entry) && strings.TrimSuffix(name, filepath.Ext(name)) == title {
-			return home.Open(filepath.Join("Moments", name))
+			return filepath.Join("Moments", name), nil
 		}
 	}
-	return nil, fs.ErrNotExist
+	return "", fs.ErrNotExist
+}
+
+func renameMoment(requestContext context.Context, home *os.Root, title, asked string) (string, error) {
+	path, findError := findMoment(home, title)
+	if findError != nil {
+		return "", findError
+	}
+	wanted := cleanTitle(asked)
+	if wanted == "" {
+		var probed moment
+		if probedJSON, probeError := probeMoment(requestContext, home, filepath.Base(path)); probeError == nil {
+			json.Unmarshal(probedJSON, &probed)
+		}
+		if probed.SourceName != "" {
+			wanted = cleanTitle(prefill(probed.SourceName, probed.Start))
+		}
+	}
+	if wanted == "" || fitTitle(wanted, 0) == title {
+		return title, nil
+	}
+	renamed, placeError := place(filepath.Join(home.Name(), path), wanted, ".mp4")
+	if placeError != nil {
+		// Unwrapped, so the error the page shows names no path on the server.
+		return "", fmt.Errorf("can't rename %q: %w", title, cmp.Or(errors.Unwrap(placeError), placeError))
+	}
+	return renamed, nil
+}
+
+func deleteMoment(home *os.Root, data, title string) error {
+	path, findError := findMoment(home, title)
+	if findError != nil {
+		return findError
+	}
+	info, statError := home.Stat(path)
+	if statError != nil {
+		return statError
+	}
+	if removeError := home.Remove(path); removeError != nil {
+		return removeError
+	}
+	os.Remove(filepath.Join(data, "cache", posterName(info)))
+	return nil
+}
+
+// Keyed without the file's name, so a Moment renamed keeps its poster.
+func posterName(info fs.FileInfo) string {
+	return fmt.Sprintf("posters/%x.jpg", sha256.Sum256(fmt.Appendf(nil, "%d %d", info.Size(), info.ModTime().UnixNano())))
 }
 
 const momentTags = "creation_time,moments.source_name,moments.source_path,moments.start,moments.end"
@@ -154,24 +211,33 @@ func prefill(name string, start float64) string {
 	return fmt.Sprintf("%s · %d:%02d:%02d", name, s/3600, s/60%60, s%60)
 }
 
-// place renames the Moment at tmp, a dotfile in the Moments folder, into place
-// as an MP4 named after title, cut to fit a file's name, with " (2)", " (3)"
-// and so on after it when the name is taken, and returns the title it took.
-func place(tmp, title string) (string, error) {
-	for n := 1; ; n++ {
+// Held while placing: os.Rename replaces a file already there.
+var placing sync.Mutex
+
+// place renames the file at from, in the folder it's in, to title with the
+// extension after it, title cut to fit a file's name, with " (2)", " (3)" and
+// so on after it when the name is taken, and returns the title it took.
+func place(from, title, extension string) (string, error) {
+	placing.Lock()
+	defer placing.Unlock()
+	for attempt := 1; ; attempt++ {
 		suffix := ""
-		if n > 1 {
-			suffix = fmt.Sprintf(" (%d)", n)
+		if attempt > 1 {
+			suffix = fmt.Sprintf(" (%d)", attempt)
 		}
-		name := fit(title, maxName-len(suffix+".mp4")) + suffix
-		file := filepath.Join(filepath.Dir(tmp), name+".mp4")
-		switch _, err := os.Lstat(file); {
-		case errors.Is(err, fs.ErrNotExist):
-			return name, os.Rename(tmp, file)
-		case err != nil:
-			return "", err
+		name := fit(title, maxName-len(suffix)-len(extension)) + suffix
+		candidate := filepath.Join(filepath.Dir(from), name+extension)
+		switch _, statError := os.Lstat(candidate); {
+		case errors.Is(statError, fs.ErrNotExist):
+			return name, os.Rename(from, candidate)
+		case statError != nil:
+			return "", statError
 		}
 	}
+}
+
+func fitTitle(title string, suffixBytes int) string {
+	return fit(title, maxName-suffixBytes-len(".mp4"))
 }
 
 // fit cuts s to n bytes at most, between characters, and drops the spaces it

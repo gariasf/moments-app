@@ -174,8 +174,9 @@
 
 			async function queueSwitches(tests) {
 				const switches = [];
+				const problems = [];
 				let endedAt;
-				for (const test of tests) {
+				for (const [index, test] of [...tests, tests[0]].entries()) {
 					let shownAt;
 					const ended = new Promise((resolve) =>
 						video.addEventListener("ended", () => resolve(performance.now()), { once: true }),
@@ -185,14 +186,17 @@
 						shownAt = now;
 						return true;
 					}, 5000);
+					if (!shownAt) problems.push(`queue: no frame from ${test.label}`);
 					if (endedAt) switches.push(`${test.label} ${shownAt ? `${Math.round(shownAt - endedAt)} ms` : "no frame"}`);
+					if (index === tests.length) break;
 					endedAt = await Promise.race([ended, sleep(5000)]);
 					if (!endedAt) {
-						switches.push(`${test.label} never ended${video.error ? `: MediaError ${video.error.code}` : ""}`);
+						problems.push(`queue: ${test.label} never ended${video.error ? `: MediaError ${video.error.code}` : ""}`);
 						break;
 					}
 				}
 				say(`queue switches: to ${switches.join(", to ")}`);
+				return problems;
 			}
 
 			async function seek(test) {
@@ -219,11 +223,11 @@
 					say(`${test.file}: ${verdict}${unexpected ? `, want ${test.want}` : ""}: ${detail}`);
 				}
 				await loops(queue[0]);
-				await queueSwitches(queue);
+				mismatches.push(...(await queueSwitches(queue)));
 				await seek(queue[0]);
 				await seek(queue.at(-1));
 				video.pause();
-				say(mismatches.length ? `FAIL: ${mismatches.join("; ")}` : "pass: every test Moment as #13's iPhone column says");
+				say(mismatches.length ? `FAIL: ${mismatches.join("; ")}` : "pass: every test Moment as #13's iPhone column says, and the Queue moves on at each ended");
 				status.textContent = (await posted)
 					? "Done, and the results reached the Umbrel."
 					: "Done, but sending the results failed: screenshot this page.";

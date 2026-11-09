@@ -350,10 +350,13 @@ function buffered({ buffered }: HTMLVideoElement, time: number) {
 }
 
 /** Fetches the JSON at url, or throws what the server says went wrong. */
-export async function getJSON<T>(url: string, signal: AbortSignal): Promise<T> {
-	const res = await fetch(url, { signal });
-	if (!res.ok) throw new Error((await res.text()).trim());
-	return res.json();
+export async function getJSON<T>(
+	url: string,
+	signal?: AbortSignal,
+): Promise<T> {
+	const response = await fetch(url, { signal });
+	if (!response.ok) throw new Error((await response.text()).trim());
+	return response.json();
 }
 
 // once resolves on target's next event of type, and rejects when signal

@@ -1,36 +1,53 @@
 import { cn } from "cn";
-import { Maximize, Minimize, Volume2, VolumeX, X } from "lucide-react";
+import {
+	ListMinus,
+	ListPlus,
+	Maximize,
+	Minimize,
+	SkipBack,
+	SkipForward,
+	Volume2,
+	VolumeX,
+	X,
+} from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Button } from "@/components/ui/button";
 
 type IPhoneVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void };
 
 // Mount it inside flushSync from the tap that opens it: play() must run within that tap for sound.
 export function MomentPlayer({
-	title,
+	titles,
 	onClose,
+	queueToggle,
 }: {
-	title: string;
+	titles: string[];
 	onClose: () => void;
+	queueToggle?: { queued: boolean; onToggle: () => void };
 }) {
 	const stage = useRef<HTMLDivElement>(null);
 	const video = useRef<IPhoneVideo>(null);
-	const [started, setStarted] = useState(false);
+	const [index, setIndex] = useState(0);
+	const [startedIndex, setStartedIndex] = useState<number>();
 	const [muted, setMuted] = useState(false);
 	const [fullScreen, setFullScreen] = useState(false);
-	const [problem, setProblem] = useState("");
+	const [problem, setProblem] = useState<{ index: number; message: string }>();
+	const title = titles[index];
+	const inQueue = !queueToggle;
 
 	useLayoutEffect(() => {
 		const element = video.current;
 		const refused = (error: Error) => {
-			if (error.name !== "AbortError") setProblem(error.message);
+			if (error.name !== "AbortError")
+				setProblem({ index, message: error.message });
 		};
 		element?.play().catch((error: Error) => {
 			if (error.name !== "NotAllowedError") return refused(error);
 			element.muted = true;
 			element.play().catch(refused);
 		});
-	}, []);
+	}, [index]);
 
 	useEffect(() => {
 		const onFullScreenChange = () =>
@@ -52,6 +69,9 @@ export function MomentPlayer({
 		else video.current?.webkitEnterFullscreen?.();
 	}
 
+	const indexAfter = (offset: number) =>
+		(index + offset + titles.length) % titles.length;
+
 	return (
 		<div
 			ref={stage}
@@ -64,37 +84,80 @@ export function MomentPlayer({
 			<video
 				ref={video}
 				src={`/api/moments/${encodeURIComponent(title)}/file`}
-				loop
+				loop={titles.length === 1}
 				playsInline
 				preload="auto"
-				onPlaying={() => setStarted(true)}
+				onPlaying={() => {
+					setStartedIndex(index);
+					setProblem(undefined);
+				}}
+				onEnded={() => setIndex(indexAfter(1))}
 				onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
 				onError={(event) =>
-					setProblem(
-						event.currentTarget.error?.message ||
+					setProblem({
+						index,
+						message:
+							event.currentTarget.error?.message ||
 							"the browser can't play its file",
-					)
+					})
 				}
 				className="size-full object-contain"
 			/>
-			{problem && (
+			{problem?.index === index && (
 				<p
 					role="alert"
 					className="absolute inset-0 grid place-items-center p-6 text-center text-sm"
 				>
-					Can't play this Moment: {problem}
+					Can't play this Moment: {problem.message}
 				</p>
 			)}
 			<p
+				key={index}
 				data-title
 				className={cn(
-					"pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 px-6 pt-16 pb-8 font-heading font-semibold text-xl transition-opacity delay-[2500ms] duration-1000",
-					started && "opacity-0",
+					"pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 px-6 pt-16 pb-8 font-heading font-semibold text-xl",
+					startedIndex === index &&
+						"animate-out fade-out fill-mode-forwards delay-2500 duration-1000",
 				)}
 			>
 				{title}
 			</p>
+			{inQueue && (
+				<div className="absolute top-3 left-3 flex items-center gap-1 rounded-xl bg-black/40 p-1 backdrop-blur-sm">
+					<Button
+						variant="ghost"
+						size="icon-lg"
+						aria-label="Previous"
+						onClick={() => flushSync(() => setIndex(indexAfter(-1)))}
+					>
+						<SkipBack />
+					</Button>
+					<span className="px-1 font-medium text-sm tabular-nums">
+						{index + 1} / {titles.length}
+					</span>
+					<Button
+						variant="ghost"
+						size="icon-lg"
+						aria-label="Next"
+						onClick={() => flushSync(() => setIndex(indexAfter(1)))}
+					>
+						<SkipForward />
+					</Button>
+				</div>
+			)}
 			<div className="absolute top-3 right-3 flex gap-1 rounded-xl bg-black/40 p-1 backdrop-blur-sm">
+				{queueToggle && (
+					<Button
+						variant="ghost"
+						size="icon-lg"
+						aria-label={
+							queueToggle.queued ? "Remove from Queue" : "Add to Queue"
+						}
+						onClick={queueToggle.onToggle}
+					>
+						{queueToggle.queued ? <ListMinus /> : <ListPlus />}
+					</Button>
+				)}
 				<Button
 					variant="ghost"
 					size="icon-lg"

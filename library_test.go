@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -253,6 +255,123 @@ func TestAMomentsFileAnswersRangeAndIfRangeRequests(t *testing.T) {
 	if missing, _ := fetchFile("Missing", nil); missing.StatusCode != http.StatusNotFound {
 		t.Errorf("a missing Moment's file answers %s, want 404 Not Found", missing.Status)
 	}
+}
+
+func TestRenamingAMomentRenamesItsFileUnderTheTitleRules(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	moments := filepath.Join(home, "Moments")
+	clip(t, filepath.Join(moments, "Clip.MP4"), "-t", "1", "-c:v", "libx264", "-c:a", "aac", "-movflags", "+use_metadata_tags",
+		"-metadata", "moments.source_name=Clip (2024)", "-metadata", "moments.start=12.5")
+	clip(t, filepath.Join(moments, "Taken.mp4"), "-t", "1", "-c:v", "libx264", "-c:a", "aac")
+	server := serve(t, home)
+
+	long, fitted := strings.Repeat("Ö", 200), strings.Repeat("Ö", 125)
+	for _, step := range []struct{ from, to, want string }{
+		{"Clip", "AC/DC\tLive", "AC⧸DC Live"},
+		{"AC⧸DC Live", "Taken", "Taken (2)"},
+		{"Taken (2)", " . ", "Clip (2024) · 0:12"},
+		{"Clip (2024) · 0:12", "Clip (2024) · 0:12", "Clip (2024) · 0:12"},
+		{"Clip (2024) · 0:12", long, fitted},
+		{fitted, long, fitted},
+	} {
+		status, got := rename(t, server, step.from, step.to)
+		if status != http.StatusOK || got != step.want {
+			t.Errorf("renaming %q to %q answers %d, %q, want 200, %q", step.from, step.to, status, got, step.want)
+		}
+	}
+	if got, want := names(t, moments), []string{"Taken.mp4", fitted + ".mp4"}; !slices.Equal(got, want) {
+		t.Errorf("the Moments folder holds %q, want %q", got, want)
+	}
+	if status, _ := rename(t, server, "Missing", "Anything"); status != http.StatusNotFound {
+		t.Errorf("renaming a missing Moment answers %d, want 404", status)
+	}
+}
+
+func TestAMomentDownloadsAsAFileNamedAfterItsTitle(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	titles := []string{"Clip (2024) · 0:12", "Ünïcödé 映画 \"quoted\""}
+	for _, title := range titles {
+		clip(t, filepath.Join(home, "Moments", title+".mp4"), "-t", "1", "-c:v", "libx264", "-c:a", "aac")
+	}
+	server := serve(t, home)
+	for _, title := range titles {
+		response, getError := http.Get(server.URL + "/api/moments/" + url.PathEscape(title) + "/file?download")
+		if getError != nil {
+			t.Fatal(getError)
+		}
+		body, readError := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readError != nil {
+			t.Fatal(readError)
+		}
+		disposition, params, parseError := mime.ParseMediaType(response.Header.Get("Content-Disposition"))
+		if parseError != nil || disposition != "attachment" || params["filename"] != title+".mp4" {
+			t.Errorf("%s: the download's Content-Disposition is %q, want an attachment named %q (%v)", title, response.Header.Get("Content-Disposition"), title+".mp4", parseError)
+		}
+		file := filepath.Join(home, "Moments", title+".mp4")
+		if !bytes.Equal(body, readFile(t, file)) {
+			t.Errorf("%s: the download isn't the Moment's file", title)
+		}
+	}
+}
+
+func TestDeletingAMomentRemovesItsFileAndItsCachedPoster(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	moments := filepath.Join(home, "Moments")
+	clip(t, filepath.Join(moments, "Gone.mp4"), "-t", "1", "-c:v", "libx264", "-c:a", "aac")
+	clip(t, filepath.Join(moments, "Kept.mp4"), "-t", "2", "-c:v", "libx264", "-c:a", "aac")
+	server := serve(t, home)
+	posterOf(t, server, "Gone")
+	kept := posterOf(t, server, "Kept")
+	posters := filepath.Join(home, "../data/cache/posters")
+
+	if status := askDelete(t, server, "Gone"); status != http.StatusNoContent {
+		t.Fatalf("deleting a Moment answers %d, want 204", status)
+	}
+	if got := names(t, moments); !slices.Equal(got, []string{"Kept.mp4"}) {
+		t.Errorf("the Moments folder holds %q, want only Kept.mp4", got)
+	}
+	cached, readError := os.ReadDir(posters)
+	if readError != nil || len(cached) != 1 || !bytes.Equal(readFile(t, filepath.Join(posters, cached[0].Name())), kept) {
+		t.Errorf("the poster cache holds %d posters, want only the kept Moment's (%v)", len(cached), readError)
+	}
+	if status := askDelete(t, server, "Gone"); status != http.StatusNotFound {
+		t.Errorf("deleting it again answers %d, want 404", status)
+	}
+}
+
+func rename(t *testing.T, server *httptest.Server, from, to string) (status int, title string) {
+	t.Helper()
+	body, marshalError := json.Marshal(map[string]string{"title": to})
+	if marshalError != nil {
+		t.Fatal(marshalError)
+	}
+	request, requestError := http.NewRequest(http.MethodPatch, server.URL+"/api/moments/"+url.PathEscape(from), bytes.NewReader(body))
+	if requestError != nil {
+		t.Fatal(requestError)
+	}
+	response, responseError := http.DefaultClient.Do(request)
+	if responseError != nil {
+		t.Fatal(responseError)
+	}
+	defer response.Body.Close()
+	var renamed moment
+	json.NewDecoder(response.Body).Decode(&renamed)
+	return response.StatusCode, renamed.Title
+}
+
+func askDelete(t *testing.T, server *httptest.Server, title string) int {
+	t.Helper()
+	request, requestError := http.NewRequest(http.MethodDelete, server.URL+"/api/moments/"+url.PathEscape(title), nil)
+	if requestError != nil {
+		t.Fatal(requestError)
+	}
+	response, responseError := http.DefaultClient.Do(request)
+	if responseError != nil {
+		t.Fatal(responseError)
+	}
+	response.Body.Close()
+	return response.StatusCode
 }
 
 func posterOf(t *testing.T, srv *httptest.Server, title string) []byte {

@@ -548,6 +548,25 @@ func TestTheServerSaysHowEachSaveIsGoing(t *testing.T) {
 	}
 }
 
+func TestTheServerNamesEachSavesSource(t *testing.T) {
+	home, _ := newHome(t)
+	slowSource(t, home)
+	movie := "Downloads/Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv"
+	clip(t, filepath.Join(home, movie), "-t", "4", "-c:v", "libx264", "-g", "48", "-c:a", "aac", "-y")
+	server := serve(t, home)
+
+	postSave(t, server, map[string]any{"path": "Videos/Slow.mkv", "start": 0, "end": 59, "title": "Slow", "sourceName": "Not this"})
+	postSave(t, server, map[string]any{"path": movie, "start": 1, "end": 3, "title": "Movie"})
+
+	named := map[string]string{}
+	for _, listed := range listSaves(t, server) {
+		named[listed.Title] = listed.SourceName
+	}
+	if want := map[string]string{"Slow": "Slow", "Movie": "Tears of Steel (2012)"}; !maps.Equal(named, want) {
+		t.Errorf("the list named the Saves' Sources %q, want %q", named, want)
+	}
+}
+
 func TestCheckFindsAMomentThatIsntAsPlanned(t *testing.T) {
 	dir := t.TempDir()
 	moment, cut := filepath.Join(dir, "moment.mp4"), filepath.Join(dir, "cut.mp4")
@@ -593,9 +612,9 @@ func failChecks(t *testing.T) *atomic.Bool {
 }
 
 type listedSave struct {
-	ID                  int
-	Title, State, Error string
-	Percent             int
+	ID                              int
+	Title, SourceName, State, Error string
+	Percent                         int
 }
 
 func listSaves(t *testing.T, srv *httptest.Server) []listedSave {

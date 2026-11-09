@@ -1,5 +1,6 @@
 // The codec check (#19): clips that FFmpeg 7.1.5 makes decode in WebKit and in headless Chrome on the
-// Mac as #13's table says. usage: node web/checks/codec.mjs
+// Mac as #13's table says, and a Queue of three of them moves on at each `ended`, with each
+// switch's time. usage: node web/checks/codec.mjs
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -70,7 +71,28 @@ const CLIPS = [
 		probe: "ac3,unknown,ac-3,6",
 		fails: { chrome: "MediaError 4" },
 	},
+	{
+		file: "queue-h264-2.0.mp4",
+		make: `${VIDEO} ${AUDIO} -c:v libx264 -pix_fmt yuv420p -c:a aac -ch_layout stereo`,
+		probe: "h264,High,avc1,yuv420p aac,LC,mp4a,2",
+		queue: true,
+	},
+	{
+		file: "queue-h264-5.1.mp4",
+		make: `${VIDEO} ${AUDIO} -c:v libx264 -pix_fmt yuv420p -c:a aac -ch_layout 5.1`,
+		probe: "h264,High,avc1,yuv420p aac,LC,mp4a,6",
+		queue: true,
+	},
+	{
+		file: "queue-hevc-2.0.mp4",
+		make: `${VIDEO} ${AUDIO} -c:v libx265 -pix_fmt yuv420p -tag:v hvc1 -x265-params log-level=error -c:a aac -ch_layout stereo`,
+		probe: "hevc,Main,hvc1,yuv420p aac,LC,mp4a,2",
+		queue: true,
+	},
 ];
+const QUEUE = CLIPS.filter(({ queue }) => queue).map(({ file }) => file);
+const QUEUE_TIMEOUT_MS = 30_000;
+const FIRST_FRAME_TOLERANCE_S = 0.001;
 
 // The Mac has no FFmpeg, so the clips are made in Docker, once per version of this table, and
 // checked against it on every run.
@@ -83,7 +105,7 @@ function makeClips() {
 		),
 		...CLIPS.map(
 			({ file }) =>
-				`echo "${file},$(ffprobe -v error -show_entries stream=codec_name,profile,codec_tag_string,pix_fmt,channels -of csv=p=0 ${file})"`,
+				`echo "${file},$(ffprobe -v error -show_entries stream=codec_name,profile,codec_tag_string,pix_fmt,channels -of csv=p=0 ${file} | tr '\\n' ' ')"`,
 		),
 	].join("\n");
 	const dir = join(
@@ -125,11 +147,16 @@ function makeClips() {
 		writeFileSync(join(work, "probe.csv"), made.stdout);
 		renameSync(work, dir);
 	}
-	// Side data, such as AC-3's, adds empty fields at the end of a line.
+	// Side data, such as AC-3's, adds empty fields at the end of a stream's line.
 	const probed = Object.fromEntries(
 		readFileSync(join(dir, "probe.csv"), "utf8")
 			.split("\n")
-			.map((line) => line.replace(/,+$/, "").split(/,(.*)/, 2)),
+			.map((line) =>
+				line
+					.replace(/,+( |$)/g, "$1")
+					.trimEnd()
+					.split(/,(.*)/, 2),
+			),
 	);
 	const wrong = CLIPS.filter(({ file, probe }) => probed[file] !== probe);
 	for (const { file, probe } of wrong)
@@ -143,9 +170,18 @@ const engines = await runPage(
 	`codec.html?clips=${CLIPS.map(({ file }) => file).join(",")}`,
 	media,
 );
+const queued = await runPage(
+	`queue.html?clips=${QUEUE.join(",")}&timeoutMs=${QUEUE_TIMEOUT_MS}`,
+	media,
+	undefined,
+	QUEUE_TIMEOUT_MS / 1000 + 10,
+);
 const problems = [];
 const notes = [];
-for (const [engine, { error, log }] of Object.entries(engines)) {
+for (const [engine, { error, log }] of [
+	...Object.entries(engines),
+	...Object.entries(queued).map(([engine, run]) => [`${engine} queue`, run]),
+]) {
 	if (error)
 		problems.push(
 			`${engine}: ${error}`,
@@ -155,7 +191,7 @@ for (const [engine, { error, log }] of Object.entries(engines)) {
 const names = Object.keys(engines);
 const row = (cells) =>
 	cells
-		.map((cell) => cell.padEnd(16))
+		.map((cell) => cell.padEnd(20))
 		.join(" ")
 		.trimEnd();
 console.log(row(["clip", ...names]));
@@ -182,10 +218,22 @@ for (const clip of CLIPS) {
 	});
 	console.log(row([clip.file, ...cells]));
 }
+const switches = Object.entries(queued).map(([engine, { results = [] }]) => {
+	for (const { to, firstTimeS } of results) {
+		if (Math.abs(firstTimeS) > FIRST_FRAME_TOLERANCE_S)
+			problems.push(`${engine} queue: ${to} starts at ${firstTimeS} s`);
+	}
+	return `${engine} ${results.map(({ to, gapMs, fromEndedMs }) => `${to.replace(/^queue-|\.mp4$/g, "")} ${gapMs}/${fromEndedMs}`).join(", ")}`;
+});
+console.log(
+	`queue switches, ms between frames/from ended, to: ${switches.join(" · ")}`,
+);
 if (notes.length) console.log(notes.join("\n"));
 if (problems.length) {
 	console.log(`FAIL\n${problems.join("\n")}`);
 	process.exitCode = 1;
 } else {
-	console.log("pass: every clip as #13's table says");
+	console.log(
+		"pass: every clip as #13's table says, and the Queue moves on at each ended",
+	);
 }

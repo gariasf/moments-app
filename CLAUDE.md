@@ -34,7 +34,7 @@ Planning lives on the wayfinder map issue
   which has no Node types.
 - `web/checks/`: browser checks on the Mac, outside CI, in the system
   WebKit and headless Chrome, both muted. `node web/checks/codec.mjs`
-  runs the codec check, `node web/checks/trimmer.mjs <URL>` the
+  runs the codec check and the Queue's switches, `node web/checks/trimmer.mjs <URL>` the
   Trimmer check, and `node web/checks/moments.mjs <URL>` the Moments
   check, through the host run at that URL.
 - `umbrel/host-run.sh start|stop`: this branch's server on the Umbrel

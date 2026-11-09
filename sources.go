@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -25,6 +28,7 @@ type video struct {
 	Path       string `json:"path"`
 	Size       int64  `json:"size"`
 	SourceName string `json:"sourceName"` // from its folders, as the Trimmer shows it (sourceName)
+	Deletable  bool   `json:"deletable,omitempty"`
 }
 
 // videoExts recognises videos by extension. .ts is left out: in a Home it's
@@ -39,31 +43,133 @@ func isVideo(e fs.DirEntry) bool {
 	return e.Type().IsRegular() && videoExts[strings.ToLower(path.Ext(e.Name()))]
 }
 
-// hidden reports whether the page never sees the file or folder at p: the
-// Moments folder, since a Moment isn't a Source, and dotfiles and dot-folders,
-// with all that's in them.
+// hidden reports whether the page never sees the file or folder at p in Home:
+// the Moments folder, since a Moment isn't a Source, a folder named Uploads,
+// since the page's Uploads are in app data, and dotfiles and dot-folders, with
+// all that's in them.
 func hidden(p string) bool {
-	if p == "Moments" || strings.HasPrefix(p, "Moments/") {
-		return true
+	for _, shadowed := range []string{"Moments", "Uploads"} {
+		if p == shadowed || strings.HasPrefix(p, shadowed+"/") {
+			return true
+		}
 	}
 	return p != "." && strings.HasPrefix(p, ".") || strings.Contains(p, "/.")
 }
 
-// sourceFile opens the file at p in home, a path as the page sends it. Like a
-// listing, it can't reach outside Home or into hidden folders.
-func sourceFile(home *os.Root, p string) (*os.File, error) {
-	if hidden(p) {
-		return nil, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+// sourceFile opens the file at sourcePath, a path as the page sends it, in
+// home, or in Uploads in the app data folder data. Like a listing, it can't
+// reach outside either or into hidden folders.
+func sourceFile(home *os.Root, data, sourcePath string) (*os.File, error) {
+	root, inside := home, sourcePath
+	if inUploads, found := strings.CutPrefix(sourcePath, "Uploads/"); found {
+		uploads, openError := os.OpenRoot(filepath.Join(data, "uploads"))
+		if openError != nil {
+			return nil, openError
+		}
+		defer uploads.Close()
+		root, inside = uploads, inUploads
+	}
+	if hidden(inside) {
+		return nil, &fs.PathError{Op: "open", Path: sourcePath, Err: fs.ErrNotExist}
 	}
 	// Checked before opening, since opening a pipe would wait for a writer.
-	info, err := fs.Stat(home.FS(), p)
-	if err != nil {
-		return nil, err
+	info, statError := fs.Stat(root.FS(), inside)
+	if statError != nil {
+		return nil, statError
 	}
 	if !info.Mode().IsRegular() {
-		return nil, &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+		return nil, &fs.PathError{Op: "open", Path: sourcePath, Err: fs.ErrNotExist}
 	}
-	return home.Open(p)
+	return root.Open(inside)
+}
+
+func listUploads(data, query string) (listing, error) {
+	uploads := os.DirFS(filepath.Join(data, "uploads"))
+	var listed listing
+	var listError error
+	if strings.TrimSpace(query) != "" {
+		listed = searchVideos(uploads, query)
+	} else {
+		listed, listError = listFolder(uploads, "")
+	}
+	listed.Folders = []folder{}
+	for index := range listed.Videos {
+		listed.Videos[index].Path = "Uploads/" + listed.Videos[index].Path
+	}
+	return listed, listError
+}
+
+func uploadable(name string) bool {
+	return name == path.Base(name) && !strings.HasPrefix(name, ".") && videoExts[strings.ToLower(path.Ext(name))]
+}
+
+// receiveUpload streams body into Uploads, in the app data folder data, as a
+// dotfile until it's whole, then puts it in place under name. A body cut off
+// leaves nothing behind.
+func receiveUpload(data, name string, body io.Reader) (video, error) {
+	uploads := filepath.Join(data, "uploads")
+	temporary, createError := os.CreateTemp(uploads, ".uploading-*")
+	if createError != nil {
+		return video{}, createError
+	}
+	defer os.Remove(temporary.Name())
+	size, copyError := io.Copy(temporary, body)
+	if failure := errors.Join(copyError, temporary.Sync(), temporary.Close()); failure != nil {
+		return video{}, failure
+	}
+	extension := path.Ext(name)
+	placed, placeError := place(temporary.Name(), strings.TrimSuffix(name, extension), extension)
+	if placeError != nil {
+		return video{}, placeError
+	}
+	return video{Name: placed + extension, Path: "Uploads/" + placed + extension, Size: size, SourceName: placed, Deletable: true}, nil
+}
+
+var errNotDeletable = errors.New("Moments deletes only the videos in Uploads and Downloads/metube")
+
+// Opened as a root, the folder refuses links and ".." out of it.
+func deletableFolder(home *os.Root, data, sourcePath string) (root *os.Root, inside string, failure error) {
+	if sourcePath != path.Clean(sourcePath) || !videoExts[strings.ToLower(path.Ext(sourcePath))] {
+		return nil, "", errNotDeletable
+	}
+	if inside, found := strings.CutPrefix(sourcePath, "Downloads/metube/"); found && !hidden(sourcePath) {
+		if info, lstatError := home.Lstat("Downloads/metube"); lstatError == nil && !info.IsDir() {
+			return nil, "", errNotDeletable
+		}
+		root, failure = home.OpenRoot("Downloads/metube")
+		return root, inside, failure
+	}
+	if inside, found := strings.CutPrefix(sourcePath, "Uploads/"); found && !hidden(inside) {
+		root, failure = os.OpenRoot(filepath.Join(data, "uploads"))
+		return root, inside, failure
+	}
+	return nil, "", errNotDeletable
+}
+
+func checkDeletable(home *os.Root, data, sourcePath string) (root *os.Root, inside string, info fs.FileInfo, failure error) {
+	root, inside, failure = deletableFolder(home, data, sourcePath)
+	if failure != nil {
+		return nil, "", nil, failure
+	}
+	info, lstatError := root.Lstat(inside)
+	switch {
+	case errors.Is(lstatError, fs.ErrNotExist):
+		failure = lstatError
+	case lstatError != nil || !info.Mode().IsRegular():
+		failure = errNotDeletable
+	default:
+		return root, inside, info, nil
+	}
+	root.Close()
+	return nil, "", nil, failure
+}
+
+func deletable(home *os.Root, data, sourcePath string) bool {
+	root, _, _, failure := checkDeletable(home, data, sourcePath)
+	if failure == nil {
+		root.Close()
+	}
+	return failure == nil
 }
 
 // listFolder lists the folder dir in home, "" being Home itself. Links aren't
@@ -75,24 +181,24 @@ func listFolder(home fs.FS, dir string) (listing, error) {
 	if hidden(dir) {
 		return listing{}, &fs.PathError{Op: "open", Path: dir, Err: fs.ErrNotExist}
 	}
-	entries, err := fs.ReadDir(home, dir)
-	if err != nil {
-		return listing{}, err
+	entries, readError := fs.ReadDir(home, dir)
+	if readError != nil {
+		return listing{}, readError
 	}
-	l := listing{Folders: []folder{}, Videos: []video{}}
-	for _, e := range entries {
-		p := path.Join(dir, e.Name())
+	listed := listing{Folders: []folder{}, Videos: []video{}}
+	for _, entry := range entries {
+		entryPath := path.Join(dir, entry.Name())
 		switch {
-		case hidden(p):
-		case e.IsDir():
-			l.Folders = append(l.Folders, folder{e.Name(), p})
-		case isVideo(e):
-			if info, err := e.Info(); err == nil { // else gone since the folder was read
-				l.Videos = append(l.Videos, video{e.Name(), p, info.Size(), sourceName(home, p)})
+		case hidden(entryPath):
+		case entry.IsDir():
+			listed.Folders = append(listed.Folders, folder{entry.Name(), entryPath})
+		case isVideo(entry):
+			if info, infoError := entry.Info(); infoError == nil { // else gone since the folder was read
+				listed.Videos = append(listed.Videos, video{Name: entry.Name(), Path: entryPath, Size: info.Size(), SourceName: sourceName(home, entryPath)})
 			}
 		}
 	}
-	return l, nil
+	return listed, nil
 }
 
 // searchVideos finds the videos in home whose path has every word of query
@@ -103,28 +209,28 @@ func listFolder(home fs.FS, dir string) (listing, error) {
 // the Umbrel; an index if that grows a hundredfold.
 func searchVideos(home fs.FS, query string) listing {
 	words := strings.Fields(strings.ToLower(query))
-	l := listing{Folders: []folder{}, Videos: []video{}}
-	fs.WalkDir(home, ".", func(p string, d fs.DirEntry, err error) error {
+	found := listing{Folders: []folder{}, Videos: []video{}}
+	fs.WalkDir(home, ".", func(entryPath string, entry fs.DirEntry, walkError error) error {
 		switch {
-		case err != nil:
+		case walkError != nil:
 			return nil // an unreadable folder: search the rest
-		case hidden(p) && d.IsDir():
+		case hidden(entryPath) && entry.IsDir():
 			return fs.SkipDir
-		case hidden(p) || !isVideo(d):
+		case hidden(entryPath) || !isVideo(entry):
 			return nil
 		}
-		lower := strings.ToLower(p)
-		for _, w := range words {
-			if !strings.Contains(lower, w) {
+		lower := strings.ToLower(entryPath)
+		for _, word := range words {
+			if !strings.Contains(lower, word) {
 				return nil
 			}
 		}
-		if info, err := d.Info(); err == nil {
-			l.Videos = append(l.Videos, video{d.Name(), p, info.Size(), sourceName(home, p)})
+		if info, infoError := entry.Info(); infoError == nil {
+			found.Videos = append(found.Videos, video{Name: entry.Name(), Path: entryPath, Size: info.Size(), SourceName: sourceName(home, entryPath)})
 		}
 		return nil
 	})
-	return l
+	return found
 }
 
 var (

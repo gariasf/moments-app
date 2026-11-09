@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>Queue check</title>
+		<link rel="icon" href="data:," />
+		<style>
+			video {
+				width: 320px;
+			}
+		</style>
+		<script>
+			function post(body) {
+				const engine = new URLSearchParams(location.search).get("engine");
+				return fetch(`/results?engine=${engine}`, { method: "POST", body: JSON.stringify(body) });
+			}
+			addEventListener("error", (event) => post({ error: `the page threw ${event.message}` }));
+			addEventListener("unhandledrejection", (event) => post({ error: `the page threw ${event.reason}` }));
+		</script>
+	</head>
+	<body>
+		<p id="status"></p>
+		<div id="stage"></div>
+		<script type="module">
+			// Switches as MomentPlayer.tsx plays a Queue, src and play() on `ended`, or it measures something else.
+			const params = new URLSearchParams(location.search);
+			const clips = params.get("clips").split(",");
+			const timeoutMs = Number(params.get("timeoutMs"));
+			const status = document.getElementById("status");
+			const video = document.createElement("video");
+			video.muted = true;
+			video.playsInline = true;
+			document.getElementById("stage").replaceChildren(video);
+			status.textContent = "Playing the Queue, muted";
+
+			const switches = [];
+			let index = 0;
+			let lastShownAt;
+			let endedAt;
+			let handle;
+			const finish = (error) => {
+				video.cancelVideoFrameCallback(handle);
+				clearTimeout(timer);
+				video.removeAttribute("src");
+				video.load();
+				status.textContent = "Done";
+				post(error ? { error, results: switches } : { results: switches });
+			};
+			const timer = setTimeout(
+				() => finish(`${switches.length} of ${clips.length} switches in ${timeoutMs} ms`),
+				timeoutMs,
+			);
+			const onFrame = (now, { mediaTime }) => {
+				if (endedAt !== undefined) {
+					switches.push({
+						to: clips[index],
+						gapMs: Math.round(now - lastShownAt),
+						fromEndedMs: Math.round(now - endedAt),
+						firstTimeS: mediaTime,
+					});
+					endedAt = undefined;
+					if (switches.length === clips.length) return finish();
+				}
+				lastShownAt = now;
+				handle = video.requestVideoFrameCallback(onFrame);
+			};
+			const play = () => {
+				video.src = `/media/${clips[index]}`;
+				video.play().catch((exception) => finish(`${clips[index]}: ${exception.name}: ${exception.message}`));
+			};
+			video.addEventListener("ended", () => {
+				endedAt = performance.now();
+				index = (index + 1) % clips.length;
+				play();
+			});
+			video.addEventListener("error", () => finish(`${clips[index]}: MediaError ${video.error.code}: ${video.error.message}`));
+			handle = video.requestVideoFrameCallback(onFrame);
+			play();
+		</script>
+	</body>
+</html>

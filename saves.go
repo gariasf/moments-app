@@ -67,11 +67,11 @@ func newSaves(home *os.Root, data string) (*saves, error) {
 		}
 		ss.last = max(ss.last, ss.list[i].ID)
 	}
-	removeHalfWritten(filepath.Join(home.Name(), "Moments"))
+	removeHalfWritten(filepath.Join(home.Name(), "Moments"), ".saving-")
 	go func() {
 		for range ss.wake {
 			for pending, ok := ss.next(); ok; pending, ok = ss.next() {
-				step, err := saveMoment(context.Background(), home, pending, func(percent int) { ss.progress(pending.ID, percent) })
+				step, err := saveMoment(context.Background(), home, data, pending, func(percent int) { ss.progress(pending.ID, percent) })
 				failure := ""
 				if err != nil {
 					slog.Error("save failed", "path", pending.Path, "title", pending.Title, "step", step, "err", err)
@@ -86,17 +86,18 @@ func newSaves(home *os.Root, data string) (*saves, error) {
 	return ss, nil
 }
 
-// removeHalfWritten removes the half-written Moments a stop left in the
-// Moments folder, and none of the other dotfiles there, such as .DS_Store.
-func removeHalfWritten(moments string) {
-	entries, err := os.ReadDir(moments)
-	if err != nil {
-		slog.Error("can't clean up the Moments folder", "err", err)
+// removeHalfWritten removes the half-written files a stop left in folder,
+// those whose names start with prefix, and none of the other dotfiles there,
+// such as .DS_Store.
+func removeHalfWritten(folder, prefix string) {
+	entries, readError := os.ReadDir(folder)
+	if readError != nil {
+		slog.Error("can't clean up", "folder", folder, "err", readError)
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".saving-") {
-			if err := os.Remove(filepath.Join(moments, entry.Name())); err != nil {
-				slog.Error("can't remove a half-written Moment", "err", err)
+		if strings.HasPrefix(entry.Name(), prefix) {
+			if removeError := os.Remove(filepath.Join(folder, entry.Name())); removeError != nil {
+				slog.Error("can't remove a half-written file", "err", removeError)
 			}
 		}
 	}
@@ -179,6 +180,17 @@ func (ss *saves) dismiss(id int) error {
 	return err
 }
 
+var errSourceNeeded = errors.New("a Save from this Source is waiting, saving or failed, and a retry needs the Source")
+
+func (ss *saves) unlessNeeded(isSource func(savePath string) bool, remove func() error) error {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if slices.ContainsFunc(ss.list, func(listed save) bool { return isSource(listed.Path) }) {
+		return errSourceNeeded
+	}
+	return remove()
+}
+
 // all lists the Saves not yet done, in the order they were made.
 func (ss *saves) all() []save {
 	ss.mu.Lock()
@@ -221,19 +233,20 @@ func (ss *saves) finish(id int, failure string) {
 	ss.list[index].State, ss.list[index].Error = "failed", failure
 }
 
-// saveMoment cuts the Moment planned from its Source in home into the Moments
-// folder, as a dotfile until it's whole, which the Library ignores, then puts
-// it in place under its title (library.go). A rename across two mounts isn't
-// atomic, so the dotfile is in the Moments folder itself.
-func saveMoment(ctx context.Context, home *os.Root, planned save, progress func(percent int)) (step string, err error) {
-	opened, err := sourceFile(home, planned.Path)
-	if err != nil {
-		return "Open", err
+// saveMoment cuts the Moment planned from its Source, in home or in Uploads in
+// the app data folder data, into the Moments folder, as a dotfile until it's
+// whole, which the Library ignores, then puts it in place under its title
+// (library.go). A rename across two mounts isn't atomic, so the dotfile is in
+// the Moments folder itself.
+func saveMoment(saveContext context.Context, home *os.Root, data string, planned save, progress func(percent int)) (step string, failure error) {
+	opened, failure := sourceFile(home, data, planned.Path)
+	if failure != nil {
+		return "Open", failure
 	}
 	defer opened.Close()
-	probed, err := readSource(ctx, opened)
-	if err != nil {
-		return "Read", err
+	probed, failure := readSource(saveContext, opened)
+	if failure != nil {
+		return "Read", failure
 	}
 	if planned.Audio != nil {
 		if *planned.Audio >= len(probed.tracks) { // the Source was replaced since
@@ -246,15 +259,15 @@ func saveMoment(ctx context.Context, home *os.Root, planned save, progress func(
 	dotfile := filepath.Join(home.Name(), "Moments", fmt.Sprintf(".saving-%d.mp4", planned.ID))
 	defer os.Remove(dotfile) // nothing to remove once placed
 	named := sourceName(home.FS(), planned.Path)
-	start, lastFrame, err := cutMoment(ctx, opened, probed, named, planned.Path, planned.Start, planned.End, dotfile, progress)
-	if err != nil {
-		return "Write", err
+	start, lastFrame, failure := cutMoment(saveContext, opened, probed, named, planned.Path, planned.Start, planned.End, dotfile, progress)
+	if failure != nil {
+		return "Write", failure
 	}
-	if err := checkSave(ctx, dotfile, lastFrame-start, probed.video.frameLength()); err != nil {
-		return "Check", err
+	if failure := checkSave(saveContext, dotfile, lastFrame-start, probed.video.frameLength()); failure != nil {
+		return "Check", failure
 	}
-	_, err = place(dotfile, cmp.Or(cleanTitle(planned.Title), cleanTitle(prefill(named, start))))
-	return "Move", err
+	_, failure = place(dotfile, cmp.Or(cleanTitle(planned.Title), cleanTitle(prefill(named, start))), ".mp4")
+	return "Move", failure
 }
 
 var checkSave = checkMoment

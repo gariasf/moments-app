@@ -6,6 +6,14 @@ import {
 	ChevronsRight,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+	AlertDialog,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -30,23 +38,8 @@ import {
 	span,
 } from "./marks";
 import { type AudioTrack, getJSON, type Playback, playSource } from "./player";
-import { SourceBrowser } from "./SourceBrowser";
-
-type Source = { path: string; sourceName: string };
-
-// A Save as the server lists it until it's done (saves.go).
-type Save = {
-	id: number; // below 0 for one the server refused
-	path: string;
-	start: number;
-	end: number;
-	title: string;
-	state: "waiting" | "saving" | "failed";
-	error?: string;
-	percent?: number;
-	answered?: number; // when the server took it, by performance.now()
-	sent?: string; // the request of one the server refused, sent again on Retry
-};
+import { formatSize, SourceBrowser, type Video } from "./SourceBrowser";
+import { anyOnItsWay, type Save, saveStatus } from "./saves";
 
 type Moment = {
 	title: string;
@@ -75,24 +68,38 @@ async function askForSave(url: string, request: RequestInit): Promise<Save> {
 
 // The Trimmer opens on its Source browser and plays the Source picked there.
 export function Trimmer({ onBack }: { onBack: () => void }) {
-	const [source, setSource] = useState<Source>();
+	const [source, setSource] = useState<Video>();
+	const [asking, setAsking] = useState(false);
+	const leave = () => {
+		setAsking(false);
+		setSource(undefined);
+	};
+	const done = source?.deletable ? () => setAsking(true) : leave;
 	return (
 		<>
 			<header className="flex items-center gap-2 px-4 py-3">
 				<Button
 					variant="ghost"
 					className="-ml-2.5"
-					onClick={source ? () => setSource(undefined) : onBack}
+					onClick={source ? done : onBack}
 				>
 					<ArrowLeft />
-					{source ? "Sources" : "Library"}
+					{source ? "Done" : "Library"}
 				</Button>
 				<h1 className="truncate font-heading font-semibold text-lg">
 					{source?.sourceName ?? "Trimmer"}
 				</h1>
 			</header>
 			<main className="mx-auto w-full max-w-5xl px-4 pb-6">
-				{source && <Player key={source.path} {...source} />}
+				{source && (
+					<Player
+						key={source.path}
+						{...source}
+						asking={asking}
+						onStay={() => setAsking(false)}
+						onLeave={leave}
+					/>
+				)}
 				{/* Kept while a Source plays, so going back finds the same folder or
 				search. */}
 				<div hidden={!!source} className="mx-auto max-w-3xl">
@@ -114,7 +121,15 @@ export function Trimmer({ onBack }: { onBack: () => void }) {
 // the marked Moment, with the audio track playing, under the title in its
 // field, prefilled from sourceName and the start: the marks clear, playback
 // carries on from the end, and the Save shows until it's saved.
-function Player({ path, sourceName }: Source) {
+function Player({
+	path,
+	sourceName,
+	name,
+	size,
+	asking,
+	onStay,
+	onLeave,
+}: Video & { asking: boolean; onStay: () => void; onLeave: () => void }) {
 	const video = useRef<HTMLVideoElement>(null);
 	const playback = useRef<Playback>(null);
 	const [problem, setProblem] = useState("");
@@ -300,9 +315,13 @@ function Player({ path, sourceName }: Source) {
 		refresh.current?.(stop.signal, true);
 		return () => stop.abort();
 	}, []);
-	const onItsWay = saves.some(
-		(save) => save.state === "waiting" || save.state === "saving",
-	);
+	useEffect(() => {
+		if (!asking) return;
+		const stop = new AbortController();
+		refresh.current?.(stop.signal, true);
+		return () => stop.abort();
+	}, [asking]);
+	const onItsWay = anyOnItsWay(saves);
 	useEffect(() => {
 		if (!onItsWay) return;
 		const stop = new AbortController();
@@ -386,7 +405,10 @@ function Player({ path, sourceName }: Source) {
 			// Keys picking from a list, such as the audio tracks', are the list's,
 			// and keys typed into the title are the title's: Enter there submits
 			// it, and Esc gives the keys back.
-			if (e.target instanceof Element && e.target.closest("[role=listbox]"))
+			if (
+				e.target instanceof Element &&
+				e.target.closest("[role=listbox],[role=alertdialog]")
+			)
 				return;
 			if (e.target instanceof HTMLInputElement) {
 				if (key === "escape") e.target.blur();
@@ -573,15 +595,7 @@ function Player({ path, sourceName }: Source) {
 							{title}
 						</Button>
 						<span className="text-muted-foreground tabular-nums">
-							{!save
-								? clock(length ?? 0, length ?? 0)
-								: save.state === "failed"
-									? save.sent
-										? `Save failed: ${save.error}`
-										: save.error
-									: save.state === "saving"
-										? `Saving ${save.percent ?? 0}%`
-										: "Waiting"}
+							{save ? saveStatus(save) : clock(length ?? 0, length ?? 0)}
 						</span>
 						{save?.state === "failed" && (
 							<span className="flex gap-1">
@@ -606,7 +620,101 @@ function Player({ path, sourceName }: Source) {
 				saves the marked Moment under its title, and playback carries on from
 				its end.
 			</p>
+			<DoneSheet
+				path={path}
+				name={name}
+				size={size}
+				moments={moments.length}
+				saves={saves}
+				open={asking}
+				onStay={onStay}
+				onLeave={onLeave}
+			/>
 		</div>
+	);
+}
+
+function DoneSheet({
+	path,
+	name,
+	size,
+	moments,
+	saves,
+	open,
+	onStay,
+	onLeave,
+}: {
+	path: string;
+	name: string;
+	size: number;
+	moments: number;
+	saves: Save[];
+	open: boolean;
+	onStay: () => void;
+	onLeave: () => void;
+}) {
+	const [deleting, setDeleting] = useState(false);
+	const [problem, setProblem] = useState("");
+	const waitingFor = saves.some((save) => save.state === "failed")
+		? "Retry or dismiss the failed Save from this Source first: a retry needs it."
+		: saves.length
+			? "Delete waits until the Saves from this Source are saved."
+			: "";
+	const deleteSource = async () => {
+		setDeleting(true);
+		setProblem("");
+		try {
+			const response = await fetch(
+				`/api/sources?${new URLSearchParams({ path })}`,
+				{ method: "DELETE" },
+			);
+			if (!response.ok) throw new Error((await response.text()).trim());
+			onLeave();
+		} catch (error) {
+			setProblem((error as Error).message);
+		} finally {
+			setDeleting(false);
+		}
+	};
+	return (
+		<AlertDialog open={open} onOpenChange={(isOpen) => !isOpen && onStay()}>
+			<AlertDialogContent>
+				<AlertDialogHeader>
+					<AlertDialogTitle>Done with this Source?</AlertDialogTitle>
+					<AlertDialogDescription>
+						{moments
+							? `${moments} ${moments === 1 ? "Moment" : "Moments"} came from it. They keep playing after the Source is gone.`
+							: "No Moments came from it."}
+					</AlertDialogDescription>
+				</AlertDialogHeader>
+				<p className="text-sm">
+					<span className="break-all font-medium">{name}</span>
+					<span className="text-muted-foreground"> · {formatSize(size)}</span>
+				</p>
+				{waitingFor && (
+					<p role="status" className="text-muted-foreground text-sm">
+						{waitingFor}
+					</p>
+				)}
+				{problem && (
+					<p role="alert" className="text-destructive text-sm">
+						{problem}
+					</p>
+				)}
+				<AlertDialogFooter>
+					<Button variant="outline" onClick={onLeave}>
+						Keep it
+					</Button>
+					<Button
+						variant="destructive"
+						disabled={!!waitingFor || deleting}
+						onClick={deleteSource}
+					>
+						Delete the Source
+					</Button>
+				</AlertDialogFooter>
+			</AlertDialogContent>
+		</AlertDialog>
 	);
 }
 

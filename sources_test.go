@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newHome makes a Home laid out like the real one behind the container's
@@ -72,7 +76,7 @@ func TestListingShowsFoldersAndVideosWithSizes(t *testing.T) {
 		"Downloads/Movies/Tears of Steel (2012)": `{"folders":[],"videos":[{"name":"Tears.of.Steel.2012.1080p.BluRay.x264.mkv",` +
 			`"path":"Downloads/Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv","size":2012,"sourceName":"Tears of Steel (2012)"}]}`,
 		"Downloads/metube": `{"folders":[],"videos":[{"name":"Big Buck Bunny [aqz-KE-bpKQ].webm",` +
-			`"path":"Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm","size":60,"sourceName":"Big Buck Bunny [aqz-KE-bpKQ]"}]}`,
+			`"path":"Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm","size":60,"sourceName":"Big Buck Bunny [aqz-KE-bpKQ]","deletable":true}]}`,
 		"Videos": `{"folders":[],"videos":[{"name":"Holiday.MOV","path":"Videos/Holiday.MOV","size":4,"sourceName":"Holiday"}]}`,
 	} {
 		if got := sources(t, srv, url.Values{"path": {path}}); got != want {
@@ -89,7 +93,7 @@ func TestSearchFindsVideosByFileOrFolderNameIgnoringCase(t *testing.T) {
 		`"path":"Downloads/Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv","size":2012,"sourceName":"Tears of Steel (2012)"}`
 	pioneer := `{"name":"Pioneer.One.S02E07.2160p.WEB-DL.mkv",` +
 		`"path":"Downloads/TV Shows/Pioneer One/Season 2/Pioneer.One.S02E07.2160p.WEB-DL.mkv","size":207,"sourceName":"Pioneer One S02E07"}`
-	bunny := `{"name":"Big Buck Bunny [aqz-KE-bpKQ].webm","path":"Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm","size":60,"sourceName":"Big Buck Bunny [aqz-KE-bpKQ]"}`
+	bunny := `{"name":"Big Buck Bunny [aqz-KE-bpKQ].webm","path":"Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm","size":60,"sourceName":"Big Buck Bunny [aqz-KE-bpKQ]","deletable":true}`
 	for q, videos := range map[string]string{
 		"TEARS of steel": tears,                 // every word, across the dots
 		"tv shows":       pioneer,               // a folder's name
@@ -148,9 +152,8 @@ func TestNamesSourcesFromTheirFolders(t *testing.T) {
 		"Downloads/TV Shows/Hoshi no Uta/S01/[Subs] Hoshi no Uta - NCOP 2 [1080p].mkv":              "Hoshi no Uta NCOP2",
 		"Downloads/TV Shows/Hoshi no Uta/S01/[Subs] Hoshi no Uta - NCED (Ep 12) [1080p].mkv":        "Hoshi no Uta NCED",
 		"Downloads/TV Shows/Hoshi no Uta/S01/Bonus/Clean Credits.mkv":                               "Clean Credits",
-		// MeTube's titles and uploads keep their file names, even alone in a folder.
+		// MeTube's titles keep their file names, even alone in a folder.
 		"Downloads/metube/Big Buck Bunny 60fps 4K ⧸ Official Blender Foundation Short Film.webm": "Big Buck Bunny 60fps 4K ⧸ Official Blender Foundation Short Film",
-		"Uploads/IMG_4021 (2).MOV": "IMG_4021 (2)",
 	}
 	home := t.TempDir()
 	for p := range names {
@@ -241,4 +244,275 @@ func status(t *testing.T, srv *httptest.Server, endpoint, path string) int {
 	}
 	res.Body.Close()
 	return res.StatusCode
+}
+
+func TestDeletesOnlyMeTubeDownloadsAndUploads(t *testing.T) {
+	home, outside := newHome(t)
+	uploads := filepath.Join(home, "../data/uploads")
+	tears := "Downloads/Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv"
+	for file, contents := range map[string]string{
+		filepath.Join(uploads, "IMG_4021.MOV"): "upload",
+		filepath.Join(uploads, "notes.txt"):    "notes",
+	} {
+		if makeError := os.MkdirAll(filepath.Dir(file), 0o755); makeError != nil {
+			t.Fatal(makeError)
+		}
+		if writeError := os.WriteFile(file, []byte(contents), 0o644); writeError != nil {
+			t.Fatal(writeError)
+		}
+	}
+	for link, target := range map[string]string{
+		filepath.Join(home, "Downloads/metube/Movies"):    "../Movies",
+		filepath.Join(home, "Downloads/metube/Tears.mkv"): "../Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv",
+		filepath.Join(uploads, "Holiday.MOV"):             filepath.Join(home, "Videos/Holiday.MOV"),
+		filepath.Join(uploads, "Home"):                    home,
+		filepath.Join(home, "Downloads/metube/Elsewhere"): outside,
+		filepath.Join(home, "Downloads/metube/Remux.mkv"): filepath.Join(outside, "Tears.of.Steel.2012.Remux.mkv"),
+	} {
+		if linkError := os.Symlink(target, link); linkError != nil {
+			t.Fatal(linkError)
+		}
+	}
+	server := serve(t, home)
+
+	for _, path := range []string{
+		tears, "Videos/Holiday.MOV", "Moments/Tears of Steel (2012).mp4",
+		"Downloads/metube/../Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv", "Uploads/../../home/Videos/Holiday.MOV",
+		"Downloads/metube/Movies/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv", "Downloads/metube/Tears.mkv",
+		"Uploads/Holiday.MOV", "Uploads/Home/Videos/Holiday.MOV",
+		"Downloads/metube/Elsewhere/Tears.of.Steel.2012.Remux.mkv", "Downloads/metube/Remux.mkv",
+		"../outside/Tears.of.Steel.2012.Remux.mkv", filepath.Join(outside, "Tears.of.Steel.2012.Remux.mkv"),
+		"Downloads/metube/.metube/tmp/Big Buck Bunny [aqz-KE-bpKQ].webm",
+		"Downloads/metube", "Uploads/notes.txt",
+		"Downloads/metube/./Big Buck Bunny [aqz-KE-bpKQ].webm",
+	} {
+		if got := askToDelete(t, server, path); got != http.StatusForbidden {
+			t.Errorf("deleting %q: %d, want 403", path, got)
+		}
+	}
+	for _, file := range []string{
+		filepath.Join(home, tears), filepath.Join(home, "Videos/Holiday.MOV"), filepath.Join(home, "Moments/Tears of Steel (2012).mp4"),
+		filepath.Join(outside, "Tears.of.Steel.2012.Remux.mkv"), filepath.Join(home, "Downloads/metube/.metube/tmp/Big Buck Bunny [aqz-KE-bpKQ].webm"),
+		filepath.Join(home, "Downloads/metube/Tears.mkv"), filepath.Join(uploads, "Holiday.MOV"), filepath.Join(uploads, "notes.txt"),
+	} {
+		if _, lstatError := os.Lstat(file); lstatError != nil {
+			t.Errorf("a refused delete removed %s: %v", file, lstatError)
+		}
+	}
+
+	for path, file := range map[string]string{
+		"Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm": filepath.Join(home, "Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm"),
+		"Uploads/IMG_4021.MOV":                               filepath.Join(uploads, "IMG_4021.MOV"),
+	} {
+		if got := askToDelete(t, server, path); got != http.StatusNoContent {
+			t.Errorf("deleting %q: %d, want 204", path, got)
+		}
+		if _, lstatError := os.Lstat(file); !os.IsNotExist(lstatError) {
+			t.Errorf("deleting %q left %s: %v", path, file, lstatError)
+		}
+	}
+	if got := askToDelete(t, server, "Downloads/metube/Big Buck Bunny [aqz-KE-bpKQ].webm"); got != http.StatusNotFound {
+		t.Errorf("deleting a Source already gone: %d, want 404", got)
+	}
+
+	metube := filepath.Join(home, "Downloads/metube")
+	if removeError := os.RemoveAll(metube); removeError != nil {
+		t.Fatal(removeError)
+	}
+	if linkError := os.Symlink("Movies", metube); linkError != nil {
+		t.Fatal(linkError)
+	}
+	if got := askToDelete(t, server, "Downloads/metube/Tears of Steel (2012)/Tears.of.Steel.2012.1080p.BluRay.x264.mkv"); got != http.StatusForbidden {
+		t.Errorf("deleting through a metube folder that links to Movies: %d, want 403", got)
+	}
+	if _, lstatError := os.Lstat(filepath.Join(home, tears)); lstatError != nil {
+		t.Errorf("a refused delete removed %s: %v", tears, lstatError)
+	}
+}
+
+func TestListingsMarkTheSourcesMomentsMayDelete(t *testing.T) {
+	home, _ := newHome(t)
+	if linkError := os.Symlink("../Movies", filepath.Join(home, "Downloads/metube/Movies")); linkError != nil {
+		t.Fatal(linkError)
+	}
+	server := serve(t, home)
+
+	for _, query := range []url.Values{
+		{"path": {"Downloads/metube/Movies/Tears of Steel (2012)"}}, {"q": {"tears"}}, {"path": {"Videos"}},
+	} {
+		if got := sources(t, server, query); strings.Contains(got, "deletable") {
+			t.Errorf("%s marks a Source outside metube deletable: %s", query.Encode(), got)
+		}
+	}
+	for _, query := range []url.Values{{"path": {"Downloads/metube"}}, {"q": {"bunny"}}} {
+		if got := sources(t, server, query); !strings.Contains(got, `"deletable":true`) {
+			t.Errorf("%s doesn't mark the MeTube download deletable: %s", query.Encode(), got)
+		}
+	}
+}
+
+func TestRefusesToDeleteASourceASaveNeeds(t *testing.T) {
+	home, _ := newHome(t)
+	slowSource(t, home)
+	slow, clipped := "Downloads/metube/Slow.mkv", "Downloads/metube/Clip.mkv"
+	if renameError := os.Rename(filepath.Join(home, "Videos/Slow.mkv"), filepath.Join(home, slow)); renameError != nil {
+		t.Fatal(renameError)
+	}
+	linked := "Downloads/metube/Linked.mkv"
+	for _, path := range []string{clipped, linked} {
+		clip(t, filepath.Join(home, path), "-t", "4", "-c:v", "libx264", "-g", "48", "-c:a", "aac")
+	}
+	if linkError := os.Symlink("../Downloads/metube/Linked.mkv", filepath.Join(home, "Videos/Linked.mkv")); linkError != nil {
+		t.Fatal(linkError)
+	}
+	failChecks(t).Store(true)
+	server := serve(t, home)
+
+	postSave(t, server, map[string]any{"path": slow, "start": 0, "end": 59, "title": "Slow"})
+	postSave(t, server, map[string]any{"path": clipped, "start": 1, "end": 3, "title": "Clip"})
+	postSave(t, server, map[string]any{"path": "Videos/Linked.mkv", "start": 1, "end": 3, "title": "Linked"})
+	for _, path := range []string{slow, clipped, linked} {
+		if got := askToDelete(t, server, path); got != http.StatusConflict {
+			t.Errorf("deleting %q while a Save from it is on its way: %d, want 409", path, got)
+		}
+	}
+	failed := waitForFailure(t, server, "Clip")
+	waitForFailure(t, server, "Linked")
+	if got := askToDelete(t, server, linked); got != http.StatusConflict {
+		t.Errorf("deleting %q while a Save from it through a link has failed: %d, want 409", linked, got)
+	}
+	if got := askToDelete(t, server, clipped); got != http.StatusConflict {
+		t.Errorf("deleting %q while a Save from it has failed: %d, want 409", clipped, got)
+	}
+	if got := askSave(t, server, http.MethodDelete, failed.ID, ""); got != http.StatusNoContent {
+		t.Fatalf("dismissing the failed Save: %d", got)
+	}
+	if got := askToDelete(t, server, clipped); got != http.StatusNoContent {
+		t.Errorf("deleting %q once its Save is dismissed: %d, want 204", clipped, got)
+	}
+}
+
+func askToDelete(t *testing.T, server *httptest.Server, path string) int {
+	t.Helper()
+	request, requestError := http.NewRequest(http.MethodDelete, server.URL+"/api/sources?"+url.Values{"path": {path}}.Encode(), nil)
+	if requestError != nil {
+		t.Fatal(requestError)
+	}
+	response, responseError := http.DefaultClient.Do(request)
+	if responseError != nil {
+		t.Fatal(responseError)
+	}
+	response.Body.Close()
+	return response.StatusCode
+}
+
+func TestUploadsLandInUploadsUnderTheirNames(t *testing.T) {
+	home, _ := newHome(t)
+	shadowed := filepath.Join(home, "Uploads/IMG_4021.MOV")
+	if makeError := os.MkdirAll(filepath.Dir(shadowed), 0o755); makeError != nil {
+		t.Fatal(makeError)
+	}
+	if writeError := os.WriteFile(shadowed, []byte("home"), 0o644); writeError != nil {
+		t.Fatal(writeError)
+	}
+	server := serve(t, home)
+
+	for _, want := range []string{"Uploads/IMG_4021.MOV", "Uploads/IMG_4021 (2).MOV", "Uploads/IMG_4021 (3).MOV"} {
+		if got := upload(t, server, "IMG_4021.MOV", "video", http.StatusCreated); !strings.Contains(got, `"path":"`+want+`"`) {
+			t.Errorf("uploading IMG_4021.MOV: %s, want it at %s", got, want)
+		}
+	}
+	want := `{"folders":[],"videos":[` +
+		`{"name":"IMG_4021 (2).MOV","path":"Uploads/IMG_4021 (2).MOV","size":5,"sourceName":"IMG_4021 (2)","deletable":true},` +
+		`{"name":"IMG_4021 (3).MOV","path":"Uploads/IMG_4021 (3).MOV","size":5,"sourceName":"IMG_4021 (3)","deletable":true},` +
+		`{"name":"IMG_4021.MOV","path":"Uploads/IMG_4021.MOV","size":5,"sourceName":"IMG_4021","deletable":true}]}`
+	if got := sources(t, server, url.Values{"path": {"Uploads"}}); got != want {
+		t.Errorf("listing Uploads:\n got %s\nwant %s", got, want)
+	}
+	if got := sources(t, server, url.Values{"q": {"img (2)"}}); !strings.Contains(got, `"path":"Uploads/IMG_4021 (2).MOV"`) || strings.Contains(got, `"path":"Uploads/IMG_4021.MOV"`) {
+		t.Errorf("searching for img (2): %s, want only Uploads/IMG_4021 (2).MOV", got)
+	}
+	if got := sources(t, server, url.Values{"q": {"img"}}) + sources(t, server, url.Values{"path": {""}}); strings.Contains(got, `"size":4`) || strings.Contains(got, `"path":"Uploads"`) {
+		t.Errorf("Home's own Uploads folder shows: %s", got)
+	}
+
+	clipped := filepath.Join(t.TempDir(), "Clip.mkv")
+	clip(t, clipped, "-t", "2", "-c:v", "libx264", "-c:a", "aac")
+	video, readError := os.ReadFile(clipped)
+	if readError != nil {
+		t.Fatal(readError)
+	}
+	upload(t, server, "Clip.mkv", string(video), http.StatusCreated)
+	get(t, server.URL+"/api/source?"+url.Values{"path": {"Uploads/Clip.mkv"}}.Encode(), "application/json")
+
+	for _, name := range []string{"", "../Clip.mkv", "Videos/Clip.mkv", ".Clip.mkv", "notes.txt"} {
+		upload(t, server, name, "video", http.StatusBadRequest)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(home, "../data/uploads")); len(entries) != 4 {
+		t.Errorf("Uploads holds %d files after the refused uploads, want 4", len(entries))
+	}
+}
+
+func upload(t *testing.T, server *httptest.Server, name, body string, wantStatus int) string {
+	t.Helper()
+	response, postError := http.Post(server.URL+"/api/uploads?"+url.Values{"name": {name}}.Encode(), "video/quicktime", strings.NewReader(body))
+	if postError != nil {
+		t.Fatal(postError)
+	}
+	defer response.Body.Close()
+	answer, _ := io.ReadAll(response.Body)
+	if response.StatusCode != wantStatus {
+		t.Errorf("uploading %q: %s %s, want %d", name, response.Status, answer, wantStatus)
+	}
+	return string(answer)
+}
+
+func TestAnUploadCutOffLeavesNothingBehind(t *testing.T) {
+	home, _ := newHome(t)
+	server := serve(t, home)
+	uploads := filepath.Join(home, "../data/uploads")
+
+	connection, dialError := net.Dial("tcp", server.Listener.Addr().String())
+	if dialError != nil {
+		t.Fatal(dialError)
+	}
+	fmt.Fprintf(connection, "POST /api/uploads?name=Holiday.MOV HTTP/1.1\r\nHost: moments\r\nContent-Length: 1000000\r\n\r\n%s", strings.Repeat("v", 1000))
+	uploadsHold := func(want int) bool {
+		entries, _ := os.ReadDir(uploads)
+		return len(entries) == want
+	}
+	for deadline := time.Now().Add(10 * time.Second); !uploadsHold(1); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the upload never reached Uploads")
+		}
+	}
+	connection.Close()
+	for deadline := time.Now().Add(10 * time.Second); !uploadsHold(0); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the upload cut off stayed in Uploads")
+		}
+	}
+}
+
+func TestStartupRemovesUploadsACrashCutOff(t *testing.T) {
+	home, _ := newHome(t)
+	uploads := filepath.Join(home, "../data/uploads")
+	if makeError := os.MkdirAll(uploads, 0o755); makeError != nil {
+		t.Fatal(makeError)
+	}
+	for _, name := range []string{".uploading-123", "IMG_4021.MOV", ".DS_Store"} {
+		if writeError := os.WriteFile(filepath.Join(uploads, name), []byte("video"), 0o644); writeError != nil {
+			t.Fatal(writeError)
+		}
+	}
+	serve(t, home)
+
+	if _, statError := os.Lstat(filepath.Join(uploads, ".uploading-123")); !os.IsNotExist(statError) {
+		t.Errorf("the upload a crash cut off is still in Uploads: %v", statError)
+	}
+	for _, name := range []string{"IMG_4021.MOV", ".DS_Store"} {
+		if _, statError := os.Lstat(filepath.Join(uploads, name)); statError != nil {
+			t.Errorf("startup removed %s: %v", name, statError)
+		}
+	}
 }
