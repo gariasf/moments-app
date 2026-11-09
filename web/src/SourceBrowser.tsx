@@ -29,6 +29,8 @@ type Mount = {
 const videoExtensions =
 	".avi,.m2ts,.m4v,.mkv,.mov,.mp4,.mpeg,.mpg,.mts,.webm,.wmv";
 
+const stallTimeoutMs = 15_000;
+
 // Two places, the folders in Home and the videos in them, and Uploads, or a
 // search across both. Picking a video opens it with onOpen.
 export function SourceBrowser({
@@ -71,8 +73,28 @@ export function SourceBrowser({
 			"POST",
 			`/api/uploads?${new URLSearchParams({ name: file.name })}`,
 		);
-		request.upload.onprogress = (event) =>
+		const cutOff = () => {
+			setUploading(undefined);
+			setUploadError(
+				`The upload of ${file.name} was cut off. Upload it again.`,
+			);
+		};
+		// A proxy on the way can drop the connection without the browser noticing.
+		let stallTimer: ReturnType<typeof setTimeout> | undefined;
+		const restartStallTimer = () => {
+			clearTimeout(stallTimer);
+			stallTimer = setTimeout(() => {
+				request.abort();
+				cutOff();
+			}, stallTimeoutMs);
+		};
+		restartStallTimer();
+		request.upload.onprogress = (event) => {
+			restartStallTimer();
 			setUploading({ name: file.name, loaded: event.loaded, total: file.size });
+		};
+		request.upload.onload = restartStallTimer;
+		request.onloadend = () => clearTimeout(stallTimer);
 		request.onload = () => {
 			setUploading(undefined);
 			if (request.status !== 201) {
@@ -85,12 +107,7 @@ export function SourceBrowser({
 			setUploadCount((count) => count + 1);
 			goTo("Uploads");
 		};
-		request.onerror = () => {
-			setUploading(undefined);
-			setUploadError(
-				`The upload of ${file.name} was cut off. Upload it again.`,
-			);
-		};
+		request.onerror = cutOff;
 		request.send(file);
 	}
 
