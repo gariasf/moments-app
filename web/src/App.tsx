@@ -1,22 +1,28 @@
 import { cn } from "cn";
-import { Check, Clapperboard, ListOrdered, Play, Scissors } from "lucide-react";
+import { Clapperboard, Plus } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { MomentMenu } from "./MomentMenu";
-import { MomentPlayer } from "./MomentPlayer";
 import { getJSON } from "./player";
-import { anyOnItsWay, type Save, saveStatus } from "./saves";
-import { Trimmer } from "./Trimmer";
+import { type Screen, Shell, Toolbar, useShell } from "./Shell";
+import type { Place } from "./SourceBrowser";
+import { anyOnItsWay, type Save } from "./saves";
+import { formatLength, Trimmer } from "./Trimmer";
 import { useTabTitle } from "./title";
 
-// Two screens, so a state switch instead of a router.
 export function App() {
-	const [screen, setScreen] = useState<"library" | "trimmer">("library");
-	return screen === "library" ? (
-		<Library onOpenTrimmer={() => setScreen("trimmer")} />
-	) : (
-		<Trimmer onBack={() => setScreen("library")} />
+	const [screen, setScreen] = useState<Screen>("library");
+	const [place, setPlace] = useState<Place>({ path: "" });
+	return (
+		<Shell
+			screen={screen}
+			onScreenChange={(nextScreen, path) => {
+				setScreen(nextScreen);
+				if (path !== undefined) setPlace({ path });
+			}}
+		>
+			{screen === "library" ? <Library /> : <Trimmer place={place} />}
+		</Shell>
 	);
 }
 
@@ -27,24 +33,11 @@ type Moment = {
 	created: string;
 };
 
-function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
+function Library() {
+	const { setLibrary, queue, setQueue, toggleQueued, play } = useShell();
 	useTabTitle("Library");
 	const [moments, setMoments] = useState<Moment[]>();
 	const [error, setError] = useState("");
-	const [playing, setPlaying] = useState<{
-		titles: string[];
-		asQueue: boolean;
-	}>();
-	const [queue, setQueue] = useState<string[]>([]);
-	const [selecting, setSelecting] = useState(false);
-	const toggleQueued = (title: string) =>
-		setQueue((titles) =>
-			titles.includes(title)
-				? titles.filter((other) => other !== title)
-				: [...titles, title],
-		);
-	const play = (titles: string[], asQueue = false) =>
-		flushSync(() => setPlaying({ titles, asQueue }));
 	const [saves, setSaves] = useState<Save[]>([]); // in the order made
 	const savesNow = useRef(saves);
 	savesNow.current = saves;
@@ -123,13 +116,16 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 		return () => abort.abort();
 	}, [list, refresh]);
 	useEffect(() => {
+		if (moments) setLibrary(moments);
+	}, [moments, setLibrary]);
+	useEffect(() => {
 		if (moments)
 			setQueue((titles) =>
 				titles.filter((title) =>
 					moments.some((moment) => moment.title === title),
 				),
 			);
-	}, [moments]);
+	}, [moments, setQueue]);
 	const onItsWay = anyOnItsWay(saves);
 	useEffect(() => {
 		if (!onItsWay) return;
@@ -143,37 +139,18 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 
 	return (
 		<>
-			<header className="flex items-center justify-between gap-4 px-4 py-3">
+			<Toolbar>
 				<h1 className="font-heading text-lg">Library</h1>
-				<span className="flex gap-2">
-					{(selecting || !!moments?.length) && (
-						<Button
-							variant={selecting ? "default" : "outline"}
-							onClick={() => setSelecting(!selecting)}
-						>
-							{selecting ? <Check /> : <ListOrdered />}
-							{selecting ? "Done" : "Queue"}
-						</Button>
-					)}
-					<Button variant="outline" onClick={onOpenTrimmer}>
-						<Scissors />
-						Trimmer
-					</Button>
-				</span>
-			</header>
+				<span className="text-muted-foreground text-sm">Newest first</span>
+			</Toolbar>
 			{error ? (
-				<p role="alert" className="px-4 text-destructive text-sm">
+				<p role="alert" className="p-4 text-destructive text-sm">
 					{error}
 				</p>
 			) : moments?.length === 0 && saves.length === 0 ? (
 				<EmptyLibrary />
 			) : (
-				<ul
-					className={cn(
-						"grid grid-cols-2 gap-x-3 gap-y-4 px-4 pb-6 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5",
-						queue.length > 0 && "pb-24",
-					)}
-				>
+				<ul className="grid grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] gap-x-4 gap-y-5 p-4 pb-6 md:p-5">
 					{saves.toReversed().map((save) => (
 						<SaveTile
 							key={`save ${save.id}`}
@@ -185,19 +162,17 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 					{moments?.map((moment) => {
 						const place = queue.indexOf(moment.title) + 1;
 						return (
-							<li key={moment.title} className="flex min-w-0 flex-col gap-1.5">
+							<li
+								key={moment.title}
+								className="group relative flex min-w-0 flex-col gap-1.5"
+							>
 								<button
 									type="button"
-									aria-label={`${selecting ? "Pick" : "Play"} ${moment.title}`}
-									aria-pressed={selecting ? place > 0 : undefined}
-									onClick={() =>
-										selecting
-											? toggleQueued(moment.title)
-											: play([moment.title])
-									}
+									aria-label={`Play ${moment.title}`}
+									onClick={() => play([moment.title])}
 									className={cn(
-										"relative aspect-video overflow-hidden rounded-lg bg-black outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
-										selecting && place > 0 && "ring-3 ring-primary",
+										"relative aspect-video overflow-hidden rounded-lg bg-black outline-none ring-1 ring-foreground/5 focus-visible:ring-3 focus-visible:ring-ring/50",
+										place > 0 && "ring-2 ring-primary",
 									)}
 								>
 									<img
@@ -212,23 +187,30 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 									<span className="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 font-medium text-white text-xs tabular-nums">
 										{formatLength(moment.length)}
 									</span>
-									{(place > 0 || selecting) && (
-										<span
-											data-place
-											className={cn(
-												"absolute top-1.5 left-1.5 grid size-6 place-items-center rounded-full border-2 font-semibold text-xs tabular-nums",
-												place > 0
-													? "border-primary bg-primary text-primary-foreground"
-													: "border-white/80 bg-black/40",
-											)}
-										>
-											{place || ""}
-										</span>
+								</button>
+								<button
+									type="button"
+									aria-label={
+										place > 0
+											? `Remove ${moment.title} from the Queue, place ${place}`
+											: `Add ${moment.title} to the Queue`
+									}
+									onClick={() => toggleQueued(moment.title)}
+									className={cn(
+										"absolute top-1.5 right-1.5 grid size-7 place-items-center rounded-md font-semibold text-xs tabular-nums outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+										place > 0
+											? "bg-primary text-primary-foreground"
+											: "bg-black/70 text-white opacity-0 hover:bg-black/90 focus-visible:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100",
 									)}
+								>
+									{place || <Plus className="size-4" />}
 								</button>
 								<div className="flex items-start gap-1">
 									<div className="min-w-0 flex-1">
-										<p className="line-clamp-2 break-words font-medium text-sm">
+										<p
+											title={moment.title}
+											className="truncate font-semibold text-sm"
+										>
 											{moment.title}
 										</p>
 										{moment.sourceName && (
@@ -258,33 +240,6 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 					})}
 				</ul>
 			)}
-			{queue.length > 0 && (
-				<div className="fixed inset-x-0 bottom-0 flex justify-center p-4">
-					<div className="flex items-center gap-1 rounded-xl border bg-background p-1.5 shadow-lg">
-						<Button onClick={() => play(queue, true)}>
-							<Play />
-							Play Queue ({queue.length})
-						</Button>
-						<Button variant="ghost" onClick={() => setQueue([])}>
-							Clear
-						</Button>
-					</div>
-				</div>
-			)}
-			{playing && (
-				<MomentPlayer
-					titles={playing.titles}
-					onClose={() => setPlaying(undefined)}
-					queueToggle={
-						playing.asQueue
-							? undefined
-							: {
-									queued: queue.includes(playing.titles[0]),
-									onToggle: () => toggleQueued(playing.titles[0]),
-								}
-					}
-				/>
-			)}
 		</>
 	);
 }
@@ -301,57 +256,99 @@ function SaveTile({
 	const failed = save.state === "failed";
 	return (
 		<li className="flex min-w-0 flex-col gap-1.5">
-			<div className="relative grid aspect-video place-items-center rounded-lg bg-muted">
+			<div className="relative aspect-video overflow-hidden rounded-lg bg-black ring-1 ring-foreground/5">
+				<img
+					src={`/api/source/thumbnail?${new URLSearchParams({ path: save.path, at: save.start.toFixed(3) })}`}
+					alt=""
+					onError={(event) => {
+						event.currentTarget.hidden = true;
+					}}
+					className="size-full object-contain opacity-25 grayscale"
+				/>
 				<span
 					aria-live="polite"
-					className={`px-2 text-center font-medium text-sm tabular-nums ${failed ? "text-destructive" : "text-muted-foreground"}`}
+					className="absolute inset-0 grid place-items-center font-semibold text-xs tabular-nums"
 				>
-					{failed ? "Failed" : saveStatus(save)}
+					{failed ? (
+						<span className="rounded-md bg-destructive/15 px-2 py-1 text-destructive">
+							Save failed
+						</span>
+					) : save.state === "saving" ? (
+						<span className="relative grid size-12 place-items-center">
+							<svg
+								viewBox="0 0 36 36"
+								aria-hidden
+								className="-rotate-90 absolute inset-0"
+							>
+								<circle
+									cx="18"
+									cy="18"
+									r="15"
+									fill="none"
+									strokeWidth="3"
+									className="stroke-foreground/10"
+								/>
+								<circle
+									cx="18"
+									cy="18"
+									r="15"
+									fill="none"
+									strokeWidth="3"
+									strokeLinecap="round"
+									pathLength={100}
+									strokeDasharray={`${save.percent ?? 0} 100`}
+									className="stroke-primary"
+								/>
+							</svg>
+							{save.percent ?? 0}%
+						</span>
+					) : (
+						<span className="text-muted-foreground">Waiting</span>
+					)}
 				</span>
 				<span className="absolute right-1.5 bottom-1.5 rounded bg-black/70 px-1.5 py-0.5 font-medium text-white text-xs tabular-nums">
 					{formatLength(save.end - save.start)}
 				</span>
 			</div>
 			<div className="min-w-0">
-				<p className="line-clamp-2 break-words font-medium text-sm">
+				<p title={save.title} className="truncate font-semibold text-sm">
 					{save.title}
 				</p>
-				{save.sourceName && (
-					<p className="truncate text-muted-foreground text-xs">
-						{save.sourceName}
-					</p>
-				)}
-				{failed && (
-					<>
-						<p className="mt-1 break-words text-destructive text-xs">
-							{saveStatus(save)}
-						</p>
-						<span className="mt-1.5 flex gap-1">
-							<Button variant="outline" size="xs" onClick={onRetry}>
-								Retry
-							</Button>
-							<Button variant="ghost" size="xs" onClick={onDismiss}>
-								Dismiss
-							</Button>
+				{failed ? (
+					<p className="flex items-baseline gap-3 text-xs">
+						<Button
+							variant="link"
+							size="xs"
+							onClick={onRetry}
+							className="h-auto px-0 font-semibold"
+						>
+							Retry
+						</Button>
+						<Button
+							variant="ghost"
+							size="xs"
+							onClick={onDismiss}
+							className="h-auto px-0 font-normal text-muted-foreground hover:bg-transparent dark:hover:bg-transparent"
+						>
+							Dismiss
+						</Button>
+						<span
+							title={save.error}
+							className="min-w-0 truncate text-muted-foreground"
+						>
+							{save.error}
 						</span>
-					</>
+					</p>
+				) : (
+					save.sourceName && (
+						<p className="truncate text-muted-foreground text-xs">
+							{save.sourceName}
+						</p>
+					)
 				)}
 			</div>
 		</li>
 	);
-}
-
-function formatLength(seconds: number) {
-	const whole = Math.round(seconds);
-	const [hours, minutes, rest] = [
-		Math.floor(whole / 3600),
-		Math.floor(whole / 60) % 60,
-		whole % 60,
-	];
-	const two = (part: number) => String(part).padStart(2, "0");
-	return hours
-		? `${hours}:${two(minutes)}:${two(rest)}`
-		: `${minutes}:${two(rest)}`;
 }
 
 function EmptyLibrary() {

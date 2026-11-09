@@ -1,9 +1,11 @@
+import { cn } from "cn";
 import {
-	ArrowLeft,
 	ChevronLeft,
 	ChevronRight,
 	ChevronsLeft,
 	ChevronsRight,
+	Pause,
+	Play,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -38,9 +40,11 @@ import {
 	span,
 } from "./marks";
 import { type AudioTrack, getJSON, type Playback, playSource } from "./player";
-import { formatSize, SourceBrowser, type Video } from "./SourceBrowser";
+import { Toolbar, useLeaveGuard, useShell } from "./Shell";
+import { type Place, SourceBrowser, type Video } from "./SourceBrowser";
 import { anyOnItsWay, type Save, saveStatus } from "./saves";
 import { useTabTitle } from "./title";
+import { formatSize } from "./upload";
 
 type Moment = {
 	title: string;
@@ -67,48 +71,115 @@ async function askForSave(url: string, request: RequestInit): Promise<Save> {
 	return { ...((await response.json()) as Save), answered: performance.now() };
 }
 
-// The Trimmer opens on its Source browser and plays the Source picked there.
-export function Trimmer({ onBack }: { onBack: () => void }) {
+// What GET /api/mounts answers (main.go): how the server finds the folders
+// the package mounts, "" being Home, and how each should be.
+type Mount = {
+	path: string;
+	access: "read-only" | "writable" | "missing";
+	want: "read-only" | "writable";
+};
+
+export function Trimmer({ place }: { place: Place }) {
 	const [source, setSource] = useState<Video>();
 	const [asking, setAsking] = useState(false);
+	const [afterLeaving, setAfterLeaving] = useState<() => void>();
 	const leave = () => {
 		setAsking(false);
 		setSource(undefined);
+		setAfterLeaving(undefined);
+		afterLeaving?.();
+	};
+	const askFirst = (afterAnswer: () => void) => {
+		setAfterLeaving(() => afterAnswer);
+		setAsking(true);
+	};
+	const open = (video: Video) => {
+		if (video.path === source?.path) return;
+		if (source?.deletable) askFirst(() => setSource(video));
+		else setSource(video);
 	};
 	const done = source?.deletable ? () => setAsking(true) : leave;
+	const [placeShown, setPlaceShown] = useState(place);
+	if (place !== placeShown) {
+		setPlaceShown(place);
+		// Below md the list is hidden while a Source plays.
+		if (source && matchMedia("(width < 48rem)").matches) done();
+	}
+	useLeaveGuard(source?.deletable ? askFirst : undefined);
 	useTabTitle(source?.sourceName ?? "Trimmer");
 	return (
-		<>
-			<header className="flex items-center gap-2 px-4 py-3">
-				<Button
-					variant="ghost"
-					className="-ml-2.5"
-					onClick={source ? done : onBack}
-				>
-					<ArrowLeft />
-					{source ? "Done" : "Library"}
-				</Button>
-				<h1 className="truncate font-heading text-lg">
+		<div className="grid flex-1 content-start md:content-stretch md:grid-cols-[20rem_minmax(0,1fr)] md:grid-rows-[auto_1fr]">
+			<Toolbar>
+				<h1 className="min-w-0 truncate font-heading text-lg">
 					{source?.sourceName ?? "Trimmer"}
 				</h1>
-			</header>
-			<main className="mx-auto w-full max-w-5xl px-4 pb-6">
 				{source && (
+					<>
+						<span className="shrink-0 text-muted-foreground text-sm tabular-nums">
+							{formatSize(source.size)}
+						</span>
+						<Button variant="ghost" className="ml-auto" onClick={done}>
+							Done
+						</Button>
+					</>
+				)}
+			</Toolbar>
+			<div
+				className={cn(
+					"md:sticky md:top-0 md:col-start-1 md:row-span-2 md:row-start-1 md:h-svh md:self-start md:border-r",
+					source && "hidden md:block",
+				)}
+			>
+				<SourceBrowser place={place} playing={source?.path} onOpen={open} />
+			</div>
+			{source ? (
+				<main className="mx-auto w-full max-w-5xl p-4 pb-6 md:col-start-2 md:p-5">
 					<Player
 						key={source.path}
 						{...source}
 						asking={asking}
-						onStay={() => setAsking(false)}
+						onStay={() => {
+							setAsking(false);
+							setAfterLeaving(undefined);
+						}}
 						onLeave={leave}
 					/>
-				)}
-				{/* Kept while a Source plays, so going back finds the same folder or
-				search. */}
-				<div hidden={!!source} className="mx-auto max-w-3xl">
-					<SourceBrowser onOpen={setSource} shown={!source} />
-				</div>
-			</main>
-		</>
+				</main>
+			) : (
+				<NoSource />
+			)}
+		</div>
+	);
+}
+
+function NoSource() {
+	const [mounts, setMounts] = useState<Mount[]>([]);
+	useEffect(() => {
+		getJSON<Mount[]>("/api/mounts")
+			.then(setMounts)
+			.catch(() => {}); // the Source list reports a server that can't be reached
+	}, []);
+	return (
+		<main className="grid place-items-center p-6 text-center md:col-start-2">
+			<div className="flex max-w-sm flex-col gap-3">
+				<p className="hidden text-muted-foreground text-sm md:block">
+					Pick a Source on the left, or drop a video there.
+				</p>
+				<p className="text-muted-foreground text-xs">
+					{mounts.map((mount) => (
+						<span
+							key={mount.path}
+							className={
+								mount.access === mount.want ? undefined : "text-destructive"
+							}
+						>
+							{mount.path || "Home"} is {mount.access}
+							{mount.access !== mount.want && `, and should be ${mount.want}`}.{" "}
+						</span>
+					))}
+				</p>
+			</div>
+		</main>
 	);
 }
 
@@ -132,10 +203,12 @@ function Player({
 	onStay,
 	onLeave,
 }: Video & { asking: boolean; onStay: () => void; onLeave: () => void }) {
+	const { setLibrary } = useShell();
 	const video = useRef<HTMLVideoElement>(null);
 	const playback = useRef<Playback>(null);
 	const [problem, setProblem] = useState("");
 	const [time, setTime] = useState(0);
+	const [paused, setPaused] = useState(true);
 	const [duration, setDuration] = useState(0);
 	const [rate, setRate] = useState(1);
 	const [tracks, setTracks] = useState<AudioTrack[]>([]);
@@ -242,6 +315,7 @@ function Player({
 		made.some((item) => item.marks?.start === start && item.marks?.end === end);
 	const loadMoments = async (signal: AbortSignal) => {
 		const library = await getJSON<Moment[]>("/api/moments", signal);
+		setLibrary(library);
 		const fromHere = library
 			.filter((moment) => moment.sourcePath === path)
 			.reverse();
@@ -403,7 +477,7 @@ function Player({
 				e.metaKey ||
 				e.ctrlKey ||
 				(key !== "\\" && (e.altKey || (e.shiftKey && !arrowKey)));
-			if (!v || !p || modified) return;
+			if (!v || !p || modified || !v.checkVisibility()) return;
 			// Keys picking from a list, such as the audio tracks', are the list's,
 			// and keys typed into the title are the title's: Enter there submits
 			// it, and Esc gives the keys back.
@@ -472,6 +546,11 @@ function Player({
 			removeEventListener("keydown", onKey, true);
 		};
 	}, [path, change]);
+	const playOrPause = paused ? "Play" : "Pause";
+	const markedLength =
+		marks.start === undefined || marks.end === undefined
+			? undefined
+			: marks.end - marks.start;
 	return (
 		<div className="flex flex-col gap-2">
 			{problem && (
@@ -488,12 +567,59 @@ function Player({
 				hidden={!!problem}
 				playsInline
 				onClick={() => toggle(video.current)}
+				onPlay={() => setPaused(false)}
+				onPause={() => setPaused(true)}
 				onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
 				// NaN once the Source is gone
 				onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
 				className="aspect-video w-full rounded-lg bg-black"
 			/>
-			<div hidden={!!problem} className="flex items-center gap-3">
+			<div
+				hidden={!!problem}
+				className="flex flex-col gap-3 rounded-lg border bg-black/30 p-3"
+			>
+				<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
+					<Button
+						variant="secondary"
+						size="sm"
+						aria-label={playOrPause}
+						aria-keyshortcuts="Space"
+						title={`${playOrPause} (Space, or a click on the video)`}
+						onClick={() => toggle(video.current)}
+					>
+						{paused ? <Play /> : <Pause />}
+						<KeyHint>Space</KeyHint>
+					</Button>
+					<span className="font-semibold text-sm">
+						{clock(time, duration, true)}
+					</span>
+					<span className="text-muted-foreground">
+						/ {clock(duration, duration)}
+					</span>
+					<span className="ml-auto flex items-center gap-1">
+						{tracks.length > 1 && (
+							<AudioPicker
+								tracks={tracks}
+								track={track}
+								onPick={(trackIndex) => {
+									setTrack(trackIndex);
+									playback.current?.switchAudio(trackIndex);
+								}}
+							/>
+						)}
+						{[1, 1.5, 2].map((speed) => (
+							<Button
+								key={speed}
+								size="xs"
+								variant={speed === rate ? "secondary" : "ghost"}
+								aria-pressed={speed === rate}
+								onClick={() => setRate(speed)}
+							>
+								{speed}×
+							</Button>
+						))}
+					</span>
+				</div>
 				<SeekBar
 					path={path}
 					time={time}
@@ -505,32 +631,11 @@ function Player({
 						change((m) => seek(m, to));
 					}}
 				/>
-				<div className="flex">
-					{[1, 1.5, 2].map((r) => (
-						<Button
-							key={r}
-							size="sm"
-							variant={r === rate ? "secondary" : "ghost"}
-							aria-pressed={r === rate}
-							onClick={() => setRate(r)}
-						>
-							{r}×
-						</Button>
-					))}
-				</div>
-				{tracks.length > 1 && (
-					<AudioPicker
-						tracks={tracks}
-						track={track}
-						onPick={(n) => {
-							setTrack(n);
-							playback.current?.switchAudio(n);
-						}}
-					/>
-				)}
-			</div>
-			<div hidden={!!problem}>
-				<Nudges marks={marks} onNudge={(n) => nudging.current?.(n)} />
+				<Edges
+					marks={marks}
+					duration={duration}
+					onNudge={(nudge) => nudging.current?.(nudge)}
+				/>
 			</div>
 			<p role="status" hidden={!!problem} className="min-h-5 text-sm">
 				{marks.note && `Start: ${marks.note}`}
@@ -557,71 +662,80 @@ function Player({
 				/>
 				<Button
 					type="submit"
-					disabled={
-						marks.start === undefined || marks.end === undefined || taken(marks)
-					}
+					aria-keyshortcuts="Enter"
+					title="Save the marked Moment under its title (Enter); playback carries on from its end"
+					disabled={markedLength === undefined || taken(marks)}
 				>
-					Save
+					Save{markedLength !== undefined && ` ${formatLength(markedLength)}`}
+					<KeyHint className="bg-primary-foreground/15 text-primary-foreground">
+						↵
+					</KeyHint>
 				</Button>
 			</form>
-			{made.length > 0 && (
-				<h2 hidden={!!problem} className="font-medium text-sm">
-					Made from this Source
-				</h2>
-			)}
 			{/* Live, and there from the start, so a screen reader says how each
 			Save goes. */}
-			<ul
+			<table
 				hidden={!!problem}
 				aria-label="Made from this Source"
 				aria-live="polite"
-				className="text-sm"
+				className="mt-2 w-full text-sm"
 			>
-				{made.map(({ key, title, marks: madeFrom, save, length }) => (
-					<li key={key} className="flex flex-wrap items-center gap-x-2">
-						<Button
-							variant="ghost"
-							size="xs"
-							className="-ml-2 font-normal"
-							disabled={!madeFrom}
-							onClick={() =>
-								madeFrom &&
-								change(() => ({
-									...madeFrom,
-									edge: "end",
-									loop: true,
-									note: "",
-								}))
-							}
-						>
-							{title}
-						</Button>
-						<span className="text-muted-foreground tabular-nums">
-							{save ? saveStatus(save) : clock(length ?? 0, length ?? 0)}
-						</span>
-						{save?.state === "failed" && (
-							<span className="flex gap-1">
-								<Button variant="outline" size="xs" onClick={() => retry(save)}>
-									Retry
+				{made.length > 0 && (
+					<caption className="pb-1 text-left font-semibold text-muted-foreground text-xs uppercase tracking-wider">
+						Made from this Source
+					</caption>
+				)}
+				<tbody className="divide-y">
+					{made.map(({ key, title, start, marks: madeFrom, save, length }) => (
+						<tr key={key}>
+							<td className="py-1">
+								<Button
+									variant="ghost"
+									size="xs"
+									className="-ml-2 h-auto min-h-6 whitespace-normal text-left font-semibold"
+									disabled={!madeFrom}
+									title="Mark it again, to loop it"
+									onClick={() =>
+										madeFrom &&
+										change(() => ({
+											...madeFrom,
+											edge: "end",
+											loop: true,
+											note: "",
+										}))
+									}
+								>
+									{title}
 								</Button>
-								<Button variant="ghost" size="xs" onClick={() => dismiss(save)}>
-									Dismiss
-								</Button>
-							</span>
-						)}
-					</li>
-				))}
-			</ul>
-			<p hidden={!!problem} className="text-muted-foreground text-xs">
-				Space or a click plays and pauses. J and L jump 10 s; ← and → step a
-				frame while paused, and 5 s while playing. I and O mark the start and
-				end, which then loop until you seek away; \ turns the loop off and on,
-				and Esc clears the marks. Once an edge is marked, ← and → move it: the
-				start a keyframe, the end to the next frame it can end on, and with ⇧,
-				about {FAR.start} s and {FAR.end} s. Tab selects the other edge. Enter
-				saves the marked Moment under its title, and playback carries on from
-				its end.
-			</p>
+							</td>
+							<td className="whitespace-nowrap py-1 pl-4 text-muted-foreground tabular-nums">
+								at {formatLength(start)}
+							</td>
+							<td className="py-1 pl-4 text-right text-muted-foreground tabular-nums">
+								{save ? saveStatus(save) : formatLength(length ?? 0)}
+								{save?.state === "failed" && (
+									<span className="ml-2 inline-flex gap-1">
+										<Button
+											variant="outline"
+											size="xs"
+											onClick={() => retry(save)}
+										>
+											Retry
+										</Button>
+										<Button
+											variant="ghost"
+											size="xs"
+											onClick={() => dismiss(save)}
+										>
+											Dismiss
+										</Button>
+									</span>
+								)}
+							</td>
+						</tr>
+					))}
+				</tbody>
+			</table>
 			<DoneSheet
 				path={path}
 				name={name}
@@ -720,28 +834,57 @@ function DoneSheet({
 	);
 }
 
-// Nudges has buttons that move each marked edge as ← and → do, and ⇧← and ⇧→
-// (marks.ts), giving onNudge the nudge, and picks out the edge selected.
-function Nudges({
+function KeyHint({
+	children,
+	className,
+}: {
+	children: React.ReactNode;
+	className?: string;
+}) {
+	return (
+		<kbd
+			aria-hidden
+			className={cn(
+				"rounded bg-foreground/10 px-1 font-normal font-sans text-[10px] text-muted-foreground pointer-coarse:hidden",
+				className,
+			)}
+		>
+			{children}
+		</kbd>
+	);
+}
+
+function Edges({
 	marks,
+	duration,
 	onNudge,
 }: {
 	marks: Marks;
+	duration: number;
 	onNudge: (nudge: Nudge) => void;
 }) {
 	return (
-		<div className="flex flex-wrap gap-x-6 gap-y-1">
+		<div className="grid gap-2 sm:grid-cols-2">
 			{(["start", "end"] as const).map((edge) => {
 				const name = edge === "start" ? "Start" : "End";
+				const markKey = edge === "start" ? "I" : "O";
 				const step = edge === "start" ? "a keyframe" : "a frame it can end on";
 				const about = `about ${FAR[edge]} s`;
+				const edgeTime = marks[edge];
 				const selected = marks.start !== undefined && marks.edge === edge;
 				return (
-					<div key={edge} className="flex items-center gap-0.5">
-						<span
-							className={`mr-1 w-9 text-sm ${selected ? "font-medium" : "text-muted-foreground"}`}
-						>
-							{name}
+					<div
+						key={edge}
+						title={`${markKey} marks the ${edge} at the playhead. Once both are marked, they loop until you seek away; \\ turns the loop off and on. Tab selects the other edge, and Esc clears the marks.`}
+						className={cn(
+							"flex items-center gap-1 rounded-md py-1 pr-1 pl-2.5 text-xs ring-1",
+							selected ? "bg-primary/10 ring-primary/60" : "ring-border",
+						)}
+					>
+						<span className="font-semibold">{name}</span>
+						<KeyHint>{markKey}</KeyHint>
+						<span className="mr-1 ml-auto font-semibold text-sm tabular-nums">
+							{edgeTime === undefined ? "–" : clock(edgeTime, duration, true)}
 						</span>
 						{(
 							[
@@ -852,92 +995,94 @@ function SeekBar({
 	);
 	const along = (t: number) => `${duration ? (t / duration) * 100 : 0}%`;
 	return (
-		<div className="flex flex-1 items-center gap-3 text-muted-foreground text-xs tabular-nums">
-			{clock(time, duration)}
-			<div
-				role="slider"
-				tabIndex={-1}
-				aria-label="Seek"
-				aria-valuemin={0}
-				aria-valuemax={duration}
-				aria-valuenow={time}
-				aria-valuetext={clock(time, duration)}
-				onPointerDown={(e) => {
-					const bar = e.currentTarget.getBoundingClientRect();
-					onSeek(((e.clientX - bar.left) / bar.width) * duration);
-				}}
-				onPointerMove={(e) => {
-					if (!duration) return; // no spot has a time until the Source opens
-					const bar = e.currentTarget.getBoundingClientRect();
-					// By whole pixels, so a spot hovered over again has its
-					// thumbnail cached.
-					const x = Math.round(e.clientX - bar.left);
-					setHover({
-						time: (Math.min(Math.max(x, 0), bar.width) / bar.width) * duration,
-						left: Math.min(
-							Math.max(x, TIP_WIDTH / 2),
-							bar.width - TIP_WIDTH / 2,
-						),
-					});
-				}}
-				onPointerLeave={() => setHover(undefined)}
-				className="relative h-1.5 flex-1 cursor-pointer rounded-full bg-muted before:absolute before:-inset-y-2 before:inset-x-0"
-			>
+		<div
+			role="slider"
+			tabIndex={-1}
+			aria-label="Seek"
+			aria-valuemin={0}
+			aria-valuemax={duration}
+			aria-valuenow={time}
+			aria-valuetext={clock(time, duration)}
+			title="J and L jump 10 s; ← and → step a frame while paused, and 5 s while playing, until an edge is marked, which they then move"
+			onPointerDown={(event) => {
+				const bar = event.currentTarget.getBoundingClientRect();
+				onSeek(((event.clientX - bar.left) / bar.width) * duration);
+			}}
+			onPointerMove={(event) => {
+				if (!duration) return; // no spot has a time until the Source opens
+				const bar = event.currentTarget.getBoundingClientRect();
+				// By whole pixels, so a spot hovered over again has its
+				// thumbnail cached.
+				const x = Math.round(event.clientX - bar.left);
+				setHover({
+					time: (Math.min(Math.max(x, 0), bar.width) / bar.width) * duration,
+					left: Math.min(Math.max(x, TIP_WIDTH / 2), bar.width - TIP_WIDTH / 2),
+				});
+			}}
+			onPointerLeave={() => setHover(undefined)}
+			className="relative h-10 cursor-pointer rounded-md bg-foreground/5 text-xs tabular-nums"
+		>
+			{made.map(({ key, start, end, save }) => (
 				<div
-					className="h-full rounded-full bg-primary"
-					style={{ width: along(time) }}
+					key={key}
+					aria-hidden
+					className={cn(
+						"absolute bottom-0 h-1 rounded-full",
+						save?.state === "failed"
+							? "bg-destructive/70"
+							: save
+								? "bg-emerald-400/30"
+								: "bg-emerald-400/70",
+					)}
+					style={{ left: along(start), width: along(end - start) }}
 				/>
-				{made.map(({ key, start, end, save }) => (
-					<div
-						key={key}
-						aria-hidden
-						className={`absolute inset-y-0 ${save?.state === "failed" ? "bg-destructive/70" : save ? "bg-sky-500/30" : "bg-sky-500/70"}`}
-						style={{ left: along(start), width: along(end - start) }}
-					/>
-				))}
-				{marks.start !== undefined && marks.end !== undefined && (
-					<div
-						aria-hidden
-						className="absolute inset-y-0 bg-amber-400/50"
-						style={{
-							left: along(marks.start),
-							width: along(marks.end - marks.start),
-						}}
-					/>
-				)}
-				{(["start", "end"] as const).map((edge) => {
-					const at = marks[edge];
-					return (
-						at !== undefined && (
-							<div
-								key={edge}
-								aria-hidden
-								className="absolute -inset-y-1.5 w-0.5 -translate-x-1/2 rounded-full bg-amber-400"
-								style={{ left: along(at) }}
-							/>
-						)
-					);
-				})}
-				{hover && (
-					<div
-						aria-hidden
-						className="pointer-events-none absolute bottom-full mb-3 -translate-x-1/2 overflow-hidden rounded-md border bg-black text-center text-white"
-						style={{ left: hover.left, width: TIP_WIDTH }}
-					>
-						{thumbnail ? (
-							<img
-								src={thumbnail}
-								alt=""
-								className="aspect-video w-full object-contain"
-							/>
-						) : (
-							<div className="aspect-video" />
-						)}
-						<div className="py-0.5">{clock(hover.time, duration)}</div>
-					</div>
-				)}
-			</div>
-			{clock(duration, duration)}
+			))}
+			{marks.start !== undefined && marks.end !== undefined && (
+				<div
+					aria-hidden
+					className="absolute inset-y-0 bg-primary/30"
+					style={{
+						left: along(marks.start),
+						width: along(marks.end - marks.start),
+					}}
+				/>
+			)}
+			{(["start", "end"] as const).map((edge) => {
+				const at = marks[edge];
+				return (
+					at !== undefined && (
+						<div
+							key={edge}
+							aria-hidden
+							className="absolute inset-y-0 w-[3px] -translate-x-1/2 bg-primary"
+							style={{ left: along(at) }}
+						/>
+					)
+				);
+			})}
+			<div
+				aria-hidden
+				className="absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_6px_white]"
+				style={{ left: along(time) }}
+			/>
+			{hover && (
+				<div
+					aria-hidden
+					className="pointer-events-none absolute bottom-full z-10 mb-2 -translate-x-1/2 overflow-hidden rounded-md border bg-black text-center text-white"
+					style={{ left: hover.left, width: TIP_WIDTH }}
+				>
+					{thumbnail ? (
+						<img
+							src={thumbnail}
+							alt=""
+							className="aspect-video w-full object-contain"
+						/>
+					) : (
+						<div className="aspect-video" />
+					)}
+					<div className="py-0.5">{clock(hover.time, duration)}</div>
+				</div>
+			)}
 		</div>
 	);
 }
@@ -994,12 +1139,23 @@ function useLatestImage(url?: string) {
 	return loaded;
 }
 
-// clock writes seconds as hh:mm:ss, or as mm:ss when the Source, of length
-// duration, is under an hour.
-function clock(seconds: number, duration: number) {
+export function formatLength(seconds: number) {
+	const whole = Math.round(seconds);
+	const [hours, minutes, rest] = [
+		Math.floor(whole / 3600),
+		Math.floor(whole / 60) % 60,
+		whole % 60,
+	];
+	const two = (part: number) => String(part).padStart(2, "0");
+	return hours
+		? `${hours}:${two(minutes)}:${two(rest)}`
+		: `${minutes}:${two(rest)}`;
+}
+
+function clock(seconds: number, duration: number, hundredths = false) {
 	return new Date(seconds * 1000)
 		.toISOString()
-		.slice(duration < 3600 ? 14 : 11, 19);
+		.slice(duration < 3600 ? 14 : 11, hundredths ? 22 : 19);
 }
 
 function toggle(video: HTMLVideoElement | null) {
