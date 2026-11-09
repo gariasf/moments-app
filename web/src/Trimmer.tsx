@@ -40,6 +40,7 @@ import {
 import { type AudioTrack, getJSON, type Playback, playSource } from "./player";
 import { formatSize, SourceBrowser, type Video } from "./SourceBrowser";
 import { anyOnItsWay, type Save, saveStatus } from "./saves";
+import { useTabTitle } from "./title";
 
 type Moment = {
 	title: string;
@@ -75,6 +76,7 @@ export function Trimmer({ onBack }: { onBack: () => void }) {
 		setSource(undefined);
 	};
 	const done = source?.deletable ? () => setAsking(true) : leave;
+	useTabTitle(source?.sourceName ?? "Trimmer");
 	return (
 		<>
 			<header className="flex items-center gap-2 px-4 py-3">

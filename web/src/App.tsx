@@ -8,6 +8,7 @@ import { MomentPlayer } from "./MomentPlayer";
 import { getJSON } from "./player";
 import { anyOnItsWay, type Save, saveStatus } from "./saves";
 import { Trimmer } from "./Trimmer";
+import { useTabTitle } from "./title";
 
 // Two screens, so a state switch instead of a router.
 export function App() {
@@ -27,6 +28,7 @@ type Moment = {
 };
 
 function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
+	useTabTitle("Library");
 	const [moments, setMoments] = useState<Moment[]>();
 	const [error, setError] = useState("");
 	const [playing, setPlaying] = useState<{

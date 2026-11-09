@@ -13,6 +13,7 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Button } from "@/components/ui/button";
+import { useTabTitle } from "./title";
 
 type IPhoneVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void };
 
@@ -35,6 +36,7 @@ export function MomentPlayer({
 	const [problem, setProblem] = useState<{ index: number; message: string }>();
 	const title = titles[index];
 	const inQueue = !queueToggle;
+	useTabTitle(title);
 
 	useLayoutEffect(() => {
 		const element = video.current;

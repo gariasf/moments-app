@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+	<title>Moments</title>
+	<rect width="64" height="64" rx="14" fill="#0a0a0a"/>
+	<g fill="none" stroke="#fafafa" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+		<path d="M50 32a18 18 0 1 1-5.27-12.73"/>
+		<path d="M35.73 19.27h9v-9"/>
+	</g>
+	<path d="M28 24v16l12-8z" fill="#fafafa" stroke="#fafafa" stroke-width="3" stroke-linejoin="round"/>
+</svg>
