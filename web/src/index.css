@@ -1,11 +1,14 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "./shadcn.css";
+@import "@fontsource-variable/nunito-sans";
+@import "@fontsource/young-serif";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-	--font-heading: var(--font-sans);
+	--font-sans: "Nunito Sans Variable", ui-sans-serif, system-ui, sans-serif;
+	--font-heading: "Young Serif", Georgia, serif;
 	--color-ring: var(--ring);
 	--color-input: var(--input);
 	--color-border: var(--border);
@@ -68,5 +71,7 @@
 	}
 	html {
 		@apply font-sans;
+		/* Young Serif ships weight 400 only. */
+		font-synthesis-weight: none;
 	}
 }

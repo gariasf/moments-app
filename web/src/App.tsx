@@ -144,7 +144,7 @@ function Library({ onOpenTrimmer }: { onOpenTrimmer: () => void }) {
 	return (
 		<>
 			<header className="flex items-center justify-between gap-4 px-4 py-3">
-				<h1 className="font-heading font-semibold text-lg">Library</h1>
+				<h1 className="font-heading text-lg">Library</h1>
 				<span className="flex gap-2">
 					{(selecting || !!moments?.length) && (
 						<Button

@@ -117,7 +117,7 @@ export function MomentPlayer({
 				key={index}
 				data-title
 				className={cn(
-					"pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 px-6 pt-16 pb-8 font-heading font-semibold text-xl",
+					"pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 px-6 pt-16 pb-8 font-heading text-xl",
 					startedIndex === index &&
 						"animate-out fade-out fill-mode-forwards delay-2500 duration-1000",
 				)}

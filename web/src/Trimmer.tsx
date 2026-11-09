@@ -88,7 +88,7 @@ export function Trimmer({ onBack }: { onBack: () => void }) {
 					<ArrowLeft />
 					{source ? "Done" : "Library"}
 				</Button>
-				<h1 className="truncate font-heading font-semibold text-lg">
+				<h1 className="truncate font-heading text-lg">
 					{source?.sourceName ?? "Trimmer"}
 				</h1>
 			</header>
