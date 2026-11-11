@@ -6,8 +6,9 @@ import {
 	ChevronsRight,
 	Pause,
 	Play,
+	X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
 	AlertDialog,
 	AlertDialogContent,
@@ -27,6 +28,7 @@ import {
 } from "@/components/ui/select";
 import {
 	around,
+	clear,
 	FAR,
 	type Frames,
 	type Marks,
@@ -37,7 +39,10 @@ import {
 	press,
 	type Span,
 	seek,
+	setAt,
 	span,
+	typed,
+	typedSpan,
 } from "./marks";
 import { type AudioTrack, getJSON, type Playback, playSource } from "./player";
 import { Toolbar, useLeaveGuard, useShell } from "./Shell";
@@ -224,6 +229,7 @@ function Player({
 	// What the nudge buttons call, set by the keys' effect, so that their nudges
 	// wait their turn with the keys'.
 	const nudging = useRef<(nudge: Nudge) => void>(undefined);
+	const editing = useRef<EdgeEdits>(undefined);
 	// The title the owner typed, else the field shows the prefilled one.
 	const [title, setTitle] = useState<string>();
 	const [saves, setSaves] = useState<Save[]>([]); // in the order made
@@ -466,6 +472,28 @@ function Player({
 				}
 			});
 		nudging.current = move;
+		editing.current = {
+			clear: (edge) => later(async () => change((marks) => clear(marks, edge))),
+			reset: () => later(async () => change(() => noMarks)),
+			type: (edge, text) =>
+				new Promise((resolve) =>
+					later(async () => {
+						const duration = video.current?.duration || Infinity;
+						const time = typed(latest.current, edge, text, duration);
+						if (typeof time === "string") return resolve(time);
+						const frames = await framesAround(
+							path,
+							[typedSpan(time)],
+							stop.signal,
+						).catch(() => undefined);
+						if (!frames) return resolve("The frames there didn't load");
+						const placed = setAt(latest.current, edge, time, frames);
+						if (typeof placed === "string") return resolve(placed);
+						change(() => placed);
+						resolve("");
+					}),
+				),
+		};
 		saving.current = () => later(async () => saveMarks.current?.());
 		const onKey = (e: KeyboardEvent) => {
 			const [v, p] = [video.current, playback.current];
@@ -542,7 +570,7 @@ function Player({
 		addEventListener("keydown", onKey, true);
 		return () => {
 			stop.abort();
-			nudging.current = saving.current = undefined;
+			nudging.current = saving.current = editing.current = undefined;
 			removeEventListener("keydown", onKey, true);
 		};
 	}, [path, change]);
@@ -552,133 +580,143 @@ function Player({
 			? undefined
 			: marks.end - marks.start;
 	return (
-		<div className="flex flex-col gap-2">
-			{problem && (
-				<p
-					role="alert"
-					className="grid aspect-video place-items-center rounded-lg bg-muted p-6 text-center text-muted-foreground text-sm"
-				>
-					{problem}
-				</p>
-			)}
-			{/* biome-ignore lint/a11y/useMediaCaption: no subtitles in v1 (#17) */}
-			<video
-				ref={video}
-				hidden={!!problem}
-				playsInline
-				onClick={() => toggle(video.current)}
-				onPlay={() => setPaused(false)}
-				onPause={() => setPaused(true)}
-				onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
-				// NaN once the Source is gone
-				onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
-				className="aspect-video w-full rounded-lg bg-black"
-			/>
-			<div
-				hidden={!!problem}
-				className="flex flex-col gap-3 rounded-lg border bg-black/30 p-3"
-			>
-				<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
-					<Button
-						variant="secondary"
-						size="sm"
-						aria-label={playOrPause}
-						aria-keyshortcuts="Space"
-						title={`${playOrPause} (Space, or a click on the video)`}
-						onClick={() => toggle(video.current)}
+		<div>
+			{/* 6rem is the Toolbar's h-14 plus main's md:p-5, top and bottom. */}
+			<div className="flex flex-col gap-2 md:max-h-[calc(100svh-6rem)]">
+				{problem && (
+					<p
+						role="alert"
+						className="grid aspect-video place-items-center rounded-lg bg-muted p-6 text-center text-muted-foreground text-sm"
 					>
-						{paused ? <Play /> : <Pause />}
-						<KeyHint>Space</KeyHint>
-					</Button>
-					<span className="font-semibold text-sm">
-						{clock(time, duration, true)}
-					</span>
-					<span className="text-muted-foreground">
-						/ {clock(duration, duration)}
-					</span>
-					<span className="ml-auto flex items-center gap-1">
-						{tracks.length > 1 && (
-							<AudioPicker
-								tracks={tracks}
-								track={track}
-								onPick={(trackIndex) => {
-									setTrack(trackIndex);
-									playback.current?.switchAudio(trackIndex);
-								}}
-							/>
-						)}
-						{[1, 1.5, 2].map((speed) => (
-							<Button
-								key={speed}
-								size="xs"
-								variant={speed === rate ? "secondary" : "ghost"}
-								aria-pressed={speed === rate}
-								onClick={() => setRate(speed)}
-							>
-								{speed}×
-							</Button>
-						))}
-					</span>
-				</div>
-				<SeekBar
-					path={path}
-					time={time}
-					duration={duration}
-					marks={marks}
-					made={made}
-					onSeek={(to) => {
-						playback.current?.seek(to);
-						change((m) => seek(m, to));
-					}}
+						{problem}
+					</p>
+				)}
+				{/* biome-ignore lint/a11y/useMediaCaption: no subtitles in v1 (#17) */}
+				<video
+					ref={video}
+					hidden={!!problem}
+					playsInline
+					onClick={() => toggle(video.current)}
+					onPlay={() => setPaused(false)}
+					onPause={() => setPaused(true)}
+					onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+					// NaN once the Source is gone
+					onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
+					className="aspect-video min-h-0 w-full rounded-lg bg-black"
 				/>
-				<Edges
-					marks={marks}
-					duration={duration}
-					onNudge={(nudge) => nudging.current?.(nudge)}
-				/>
-			</div>
-			<p role="status" hidden={!!problem} className="min-h-5 text-sm">
-				{marks.note && `Start: ${marks.note}`}
-			</p>
-			<form
-				hidden={!!problem}
-				onSubmit={(e) => {
-					e.preventDefault();
-					// Then the keys are the Trimmer's again.
-					if (document.activeElement instanceof HTMLElement)
-						document.activeElement.blur();
-					saving.current?.();
-				}}
-				className="flex gap-2"
-			>
-				<Input
-					aria-label="Title"
-					placeholder="Title"
-					value={
-						title ??
-						(marks.start === undefined ? "" : prefill(sourceName, marks.start))
-					}
-					onChange={(e) => setTitle(e.target.value)}
-				/>
-				<Button
-					type="submit"
-					aria-keyshortcuts="Enter"
-					title="Save the marked Moment under its title (Enter); playback carries on from its end"
-					disabled={markedLength === undefined || taken(marks)}
+				<div
+					hidden={!!problem}
+					className="flex flex-col gap-3 rounded-lg border bg-black/30 p-3"
 				>
-					Save{markedLength !== undefined && ` ${formatLength(markedLength)}`}
-					<KeyHint className="bg-primary-foreground/15 text-primary-foreground">
-						↵
-					</KeyHint>
-				</Button>
-			</form>
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
+						<Button
+							variant="secondary"
+							size="sm"
+							aria-label={playOrPause}
+							aria-keyshortcuts="Space"
+							title={`${playOrPause} (Space, or a click on the video)`}
+							onClick={() => toggle(video.current)}
+						>
+							{paused ? <Play /> : <Pause />}
+							<KeyHint>Space</KeyHint>
+						</Button>
+						<span className="font-semibold text-sm">
+							{clock(time, duration, true)}
+						</span>
+						<span className="text-muted-foreground">
+							/ {clock(duration, duration)}
+						</span>
+						<span className="ml-auto flex items-center gap-1">
+							{tracks.length > 1 && (
+								<AudioPicker
+									tracks={tracks}
+									track={track}
+									onPick={(trackIndex) => {
+										setTrack(trackIndex);
+										playback.current?.switchAudio(trackIndex);
+									}}
+								/>
+							)}
+							{[1, 1.5, 2].map((speed) => (
+								<Button
+									key={speed}
+									size="xs"
+									variant={speed === rate ? "secondary" : "ghost"}
+									aria-pressed={speed === rate}
+									onClick={() => setRate(speed)}
+								>
+									{speed}×
+								</Button>
+							))}
+						</span>
+					</div>
+					<SeekBar
+						path={path}
+						time={time}
+						duration={duration}
+						marks={marks}
+						made={made}
+						onSeek={(to) => {
+							playback.current?.seek(to);
+							change((m) => seek(m, to));
+						}}
+					/>
+					<Edges
+						marks={marks}
+						duration={duration}
+						onNudge={(nudge) => nudging.current?.(nudge)}
+						onClear={(edge) => editing.current?.clear(edge)}
+						onReset={() => editing.current?.reset()}
+						onType={(edge, text) =>
+							editing.current?.type(edge, text) ?? Promise.resolve("")
+						}
+					/>
+				</div>
+				<p role="status" hidden={!!problem} className="min-h-5 text-sm">
+					{marks.note && `Start: ${marks.note}`}
+				</p>
+				<form
+					hidden={!!problem}
+					onSubmit={(e) => {
+						e.preventDefault();
+						// Then the keys are the Trimmer's again.
+						if (document.activeElement instanceof HTMLElement)
+							document.activeElement.blur();
+						saving.current?.();
+					}}
+					className="flex gap-2"
+				>
+					<Input
+						aria-label="Title"
+						placeholder="Title"
+						value={
+							title ??
+							(marks.start === undefined
+								? ""
+								: prefill(sourceName, marks.start))
+						}
+						onChange={(e) => setTitle(e.target.value)}
+					/>
+					<Button
+						type="submit"
+						aria-keyshortcuts="Enter"
+						title="Save the marked Moment under its title (Enter); playback carries on from its end"
+						disabled={markedLength === undefined || taken(marks)}
+					>
+						Save{markedLength !== undefined && ` ${formatLength(markedLength)}`}
+						<KeyHint className="bg-primary-foreground/15 text-primary-foreground">
+							↵
+						</KeyHint>
+					</Button>
+				</form>
+			</div>
 			{/* Live, and there from the start, so a screen reader says how each
 			Save goes. */}
 			<table
 				hidden={!!problem}
 				aria-label="Made from this Source"
 				aria-live="polite"
-				className="mt-2 w-full text-sm"
+				className={cn("w-full text-sm", made.length > 0 && "mt-4")}
 			>
 				{made.length > 0 && (
 					<caption className="pb-1 text-left font-semibold text-muted-foreground text-xs uppercase tracking-wider">
@@ -854,38 +892,64 @@ function KeyHint({
 	);
 }
 
+type EdgeEdits = {
+	clear: (edge: Marks["edge"]) => void;
+	reset: () => void;
+	type: (edge: Marks["edge"], text: string) => Promise<string>;
+};
+
 function Edges({
 	marks,
 	duration,
 	onNudge,
+	onClear,
+	onReset,
+	onType,
 }: {
 	marks: Marks;
 	duration: number;
 	onNudge: (nudge: Nudge) => void;
+	onClear: EdgeEdits["clear"];
+	onReset: EdgeEdits["reset"];
+	onType: EdgeEdits["type"];
 }) {
 	return (
-		<div className="grid gap-2 sm:grid-cols-2">
+		<div className="grid items-start gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
 			{(["start", "end"] as const).map((edge) => {
 				const name = edge === "start" ? "Start" : "End";
 				const markKey = edge === "start" ? "I" : "O";
 				const step = edge === "start" ? "a keyframe" : "a frame it can end on";
 				const about = `about ${FAR[edge]} s`;
 				const edgeTime = marks[edge];
-				const selected = marks.start !== undefined && marks.edge === edge;
+				const selected = edgeTime !== undefined && marks.edge === edge;
 				return (
 					<div
 						key={edge}
 						title={`${markKey} marks the ${edge} at the playhead. Once both are marked, they loop until you seek away; \\ turns the loop off and on. Tab selects the other edge, and Esc clears the marks.`}
 						className={cn(
-							"flex items-center gap-1 rounded-md py-1 pr-1 pl-2.5 text-xs ring-1",
+							"flex flex-wrap items-center gap-1 rounded-md py-1 pr-1 pl-2.5 text-xs ring-1",
 							selected ? "bg-primary/10 ring-primary/60" : "ring-border",
 						)}
 					>
 						<span className="font-semibold">{name}</span>
 						<KeyHint>{markKey}</KeyHint>
-						<span className="mr-1 ml-auto font-semibold text-sm tabular-nums">
-							{edgeTime === undefined ? "–" : clock(edgeTime, duration, true)}
-						</span>
+						<EdgeTime
+							name={name}
+							shown={
+								edgeTime === undefined ? "" : clock(edgeTime, duration, true)
+							}
+							onType={(text) => onType(edge, text)}
+						/>
+						<Button
+							size="icon-sm"
+							variant="ghost"
+							disabled={edgeTime === undefined}
+							aria-label={`Clear the ${edge}`}
+							title={`Clear the ${edge}, and keep the ${edge === "start" ? "end" : "start"}`}
+							onClick={() => onClear(edge)}
+						>
+							<X />
+						</Button>
 						{(
 							[
 								[-1, true, ChevronsLeft, `${about} earlier`, "⇧←"],
@@ -909,7 +973,83 @@ function Edges({
 					</div>
 				);
 			})}
+			<Button
+				variant="ghost"
+				size="xs"
+				className="justify-self-end sm:col-span-2"
+				disabled={marks.start === undefined && marks.end === undefined}
+				aria-keyshortcuts="Escape"
+				title="Clear both edges (Esc)"
+				onClick={onReset}
+			>
+				Reset
+				<KeyHint>Esc</KeyHint>
+			</Button>
 		</div>
+	);
+}
+
+function EdgeTime({
+	name,
+	shown,
+	onType,
+}: {
+	name: string;
+	shown: string;
+	onType: (text: string) => Promise<string>;
+}) {
+	const [text, setText] = useState<string>();
+	const [refusal, setRefusal] = useState("");
+	const refusalId = useId();
+	if (text === undefined)
+		return (
+			<Button
+				variant="ghost"
+				size="xs"
+				className="mr-1 ml-auto font-semibold text-sm tabular-nums"
+				aria-label={`${name} at ${shown || "none"}; type a time`}
+				title="Type a time, as 1:02:03.45, 2:03 or 123.4"
+				onClick={() => {
+					setRefusal("");
+					setText(shown);
+				}}
+			>
+				{shown || "–"}
+			</Button>
+		);
+	return (
+		<>
+			<Input
+				autoFocus
+				aria-label={`${name} time`}
+				aria-invalid={!!refusal}
+				aria-describedby={refusal ? refusalId : undefined}
+				className="mr-1 ml-auto h-7 w-24 px-2 text-sm tabular-nums md:text-sm"
+				value={text}
+				onFocus={(event) => event.currentTarget.select()}
+				onChange={(event) => {
+					setText(event.target.value);
+					setRefusal("");
+				}}
+				onBlur={() => setText(undefined)}
+				onKeyDown={async (event) => {
+					if (event.key !== "Enter") return;
+					event.preventDefault();
+					const why = await onType(text);
+					if (why) setRefusal(why);
+					else setText(undefined);
+				}}
+			/>
+			{refusal && (
+				<p
+					id={refusalId}
+					role="alert"
+					className="order-last basis-full pb-0.5 text-right text-destructive"
+				>
+					{refusal}
+				</p>
+			)}
+		</>
 	);
 }
 

@@ -9,6 +9,7 @@
 @theme inline {
 	--font-sans: "Nunito Sans Variable", ui-sans-serif, system-ui, sans-serif;
 	--font-heading: "Young Serif", Georgia, serif;
+	--font-heading--font-feature-settings: "lnum";
 	--color-ring: var(--ring);
 	--color-input: var(--input);
 	--color-border: var(--border);

@@ -24,11 +24,13 @@ export function MomentPlayer({
 	moments,
 	asQueue,
 	onClose,
+	onMove,
 	queueToggle,
 }: {
 	moments: LibraryMoment[];
 	asQueue: boolean;
 	onClose: () => void;
+	onMove: (title: string) => void;
 	queueToggle?: { queued: boolean; onToggle: () => void };
 }) {
 	const player = useRef<HTMLDivElement>(null);
@@ -76,7 +78,11 @@ export function MomentPlayer({
 
 	const indexAfter = (offset: number) =>
 		(index + offset + moments.length) % moments.length;
-	const playAt = (position: number) => flushSync(() => setIndex(position));
+	const moveTo = (position: number) => {
+		setIndex(position);
+		onMove(moments[position].title);
+	};
+	const playAt = (position: number) => flushSync(() => moveTo(position));
 
 	return (
 		<div
@@ -174,7 +180,7 @@ export function MomentPlayer({
 							setStartedIndex(index);
 							setProblem(undefined);
 						}}
-						onEnded={() => setIndex(indexAfter(1))}
+						onEnded={() => moveTo(indexAfter(1))}
 						onVolumeChange={(event) => setMuted(event.currentTarget.muted)}
 						onError={(event) =>
 							setProblem({

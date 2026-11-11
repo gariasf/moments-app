@@ -20,10 +20,10 @@ import {
 import { flushSync } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { type Address, readAddress, type Screen, urlOf } from "./address";
 import { MomentPlayer } from "./MomentPlayer";
+import { getJSON } from "./player";
 import { uploadProgress } from "./upload";
-
-export type Screen = "library" | "trimmer";
 
 export type LibraryMoment = {
 	title: string;
@@ -56,7 +56,15 @@ const ShellContext = createContext({
 	uploadError: "",
 	setUploadError: (_error: string) => {},
 	uploadCount: 0,
+	missingTitle: undefined as string | undefined,
 });
+
+function goTo(address: Address, entry: "push" | "replace") {
+	const url = urlOf(address);
+	if (url === location.pathname + location.search) return;
+	if (entry === "push") history.pushState({ pushed: true }, "", url);
+	else history.replaceState(history.state, "", url);
+}
 
 export const useShell = () => useContext(ShellContext);
 
@@ -103,11 +111,68 @@ export function Shell({
 				? titles.filter((other) => other !== title)
 				: [...titles, title],
 		);
-	const play = (titles: string[], asQueue = false) => {
+	const [missingTitle, setMissingTitle] = useState<string>();
+	const navigationCount = useRef(0);
+	const beginNavigation = () => {
+		navigationCount.current++;
 		setMenuOpen(false);
+		setMissingTitle(undefined);
+	};
+	const play = (titles: string[], asQueue = false) => {
+		beginNavigation();
+		goTo({ screen, moment: titles[0] }, "push");
 		for (const video of document.querySelectorAll("video")) video.pause();
 		flushSync(() => setPlaying({ titles, asQueue, key: ++playCount.current }));
 	};
+	const close = () => {
+		setPlaying(undefined);
+		if (history.state?.pushed) history.back();
+		else goTo({ screen }, "replace");
+	};
+	const openFromAddress = async (title: string) => {
+		const asked = navigationCount.current;
+		const moments = await getJSON<LibraryMoment[]>("/api/moments").catch(
+			() => undefined,
+		);
+		if (asked !== navigationCount.current) return;
+		if (moments && !moments.some((moment) => moment.title === title)) {
+			const showLibrary = () => {
+				goTo({ screen: "library" }, "replace");
+				onScreenChange("library");
+				setMissingTitle(title);
+			};
+			if (!leaveGuard.current) return showLibrary();
+			goTo({ screen: "trimmer" }, "replace");
+			leaveGuard.current(showLibrary);
+		} else
+			setPlaying({ titles: [title], asQueue: false, key: ++playCount.current });
+	};
+	const latestOpenFromAddress = useRef(openFromAddress);
+	latestOpenFromAddress.current = openFromAddress;
+	useEffect(() => {
+		const { moment } = readAddress(location.search);
+		if (moment) latestOpenFromAddress.current(moment);
+	}, []);
+	useEffect(() => {
+		const showAddress = () => {
+			const address = readAddress(location.search);
+			beginNavigation();
+			const go = () => {
+				onScreenChange(address.screen);
+				setPlaying(undefined);
+				if (address.moment) openFromAddress(address.moment);
+			};
+			if (address.screen === screen || !leaveGuard.current) return go();
+			setPlaying(undefined);
+			goTo({ screen }, "push");
+			leaveGuard.current(() => {
+				goTo(address, "push");
+				go();
+			});
+		};
+		addEventListener("popstate", showAddress);
+		return () => removeEventListener("popstate", showAddress);
+	});
 	const sidebar = (
 		<Sidebar
 			screen={playing ? undefined : screen}
@@ -121,11 +186,15 @@ export function Shell({
 			uploading={uploading}
 			onCancelUpload={cancelUpload}
 			onScreenChange={(nextScreen, path) => {
-				setMenuOpen(false);
+				beginNavigation();
 				setPlaying(undefined);
-				const go = () => onScreenChange(nextScreen, path);
-				if (nextScreen === screen || !leaveGuard.current) go();
-				else leaveGuard.current(go);
+				const go = () => {
+					goTo({ screen: nextScreen }, "push");
+					onScreenChange(nextScreen, path);
+				};
+				if (nextScreen === screen || !leaveGuard.current) return go();
+				goTo({ screen }, "push");
+				leaveGuard.current(go);
 			}}
 		/>
 	);
@@ -145,6 +214,7 @@ export function Shell({
 				uploadError,
 				setUploadError,
 				uploadCount,
+				missingTitle,
 			}}
 		>
 			<div className="flex min-h-svh">
@@ -170,7 +240,8 @@ export function Shell({
 								library?.find((moment) => moment.title === title) ?? { title },
 						)}
 						asQueue={playing.asQueue}
-						onClose={() => setPlaying(undefined)}
+						onClose={close}
+						onMove={(title) => goTo({ screen, moment: title }, "replace")}
 						queueToggle={
 							playing.asQueue
 								? undefined

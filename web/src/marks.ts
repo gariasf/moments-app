@@ -76,7 +76,6 @@ export function press(
 	switch (key) {
 		case "i": {
 			const start = startAt(frames, playhead);
-			const back = playhead - start;
 			// After the end, the start leaves no Moment, so the end goes.
 			const end =
 				marks.end !== undefined && marks.end >= start ? marks.end : undefined;
@@ -85,9 +84,7 @@ export function press(
 				end,
 				edge: "start",
 				loop: marks.loop && end !== undefined,
-				// Once it's a tenth of a second or more: not on the frame I was
-				// pressed on, nor on a first keyframe after it.
-				note: back >= 0.05 ? `${back.toFixed(1)} s before you pressed I` : "",
+				note: backNote(playhead - start, "you pressed I"),
 			};
 		}
 		case "o": {
@@ -113,6 +110,79 @@ export function press(
 			return { ...marks, edge: marks.edge === "start" ? "end" : "start" };
 	}
 	return marks;
+}
+
+export function clear(marks: Marks, edge: Marks["edge"]): Marks {
+	const other = edge === "start" ? "end" : "start";
+	if (marks[other] === undefined) return noMarks;
+	return {
+		...marks,
+		[edge]: undefined,
+		edge: other,
+		loop: false,
+		note: edge === "start" ? "" : marks.note,
+	};
+}
+
+/** The string returned is why edge can't take the time typed. */
+export function typed(
+	marks: Marks,
+	edge: Marks["edge"],
+	text: string,
+	duration: number,
+): number | string {
+	const parts = text.trim().split(":");
+	const last = parts[parts.length - 1];
+	const earlier = parts.slice(0, -1);
+	if (
+		parts.length > 3 ||
+		!/^\d+(\.\d+)?$/.test(last) ||
+		earlier.some((part) => !/^\d+$/.test(part)) ||
+		parts.slice(1).some((part) => Number(part) >= 60)
+	)
+		return "Type a time as 1:02:03.45, 2:03 or 123.4";
+	const time = parts.reduce((total, part) => total * 60 + Number(part), 0);
+	if (time > duration) return `The Source ends at ${clockOf(duration)}`;
+	if (edge === "start" && marks.end !== undefined && time >= marks.end)
+		return "The start must come before the end";
+	if (edge === "end" && marks.start !== undefined && time <= marks.start)
+		return "The end must come after the start";
+	return time;
+}
+
+// The clock cuts times to the hundredth, so a frame within the one typed is at it.
+const TYPED_TO = 0.0099;
+
+/** The span setAt needs the server's frames over. */
+export function typedSpan(time: number): Span {
+	return [time, time + TYPED_TO];
+}
+
+/** The string returned is why edge can't go at time. */
+export function setAt(
+	marks: Marks,
+	edge: Marks["edge"],
+	time: number,
+	frames: Frames,
+): Marks | string {
+	const shown = time + TYPED_TO;
+	if (edge === "start") {
+		const start = startAt(frames, shown);
+		if (marks.end !== undefined && start >= marks.end)
+			return "The start must come before the end";
+		return {
+			...marks,
+			start,
+			edge,
+			loop: marks.loop && marks.end !== undefined,
+			note: backNote(time - start, "the time typed"),
+		};
+	}
+	const end = atOrBefore(frames.cleanEnds, shown);
+	if (end === undefined) return "No frame to end on at or before that";
+	if (marks.start !== undefined && end <= marks.start)
+		return "The end must come after the start";
+	return { ...marks, end, edge, loop: marks.start !== undefined };
 }
 
 /**
@@ -219,10 +289,24 @@ export function seek(marks: Marks, playhead: number): Marks {
  * same (library.go).
  */
 export function prefill(name: string, start: number): string {
-	const s = Math.floor(Math.max(start, 0));
-	const [h, m, ss] = [Math.floor(s / 3600), Math.floor(s / 60) % 60, s % 60];
-	const two = (n: number) => String(n).padStart(2, "0");
-	return `${name} · ${h ? `${h}:${two(m)}` : m}:${two(ss)}`;
+	return `${name} · ${clockOf(start)}`;
+}
+
+function clockOf(seconds: number) {
+	const whole = Math.floor(Math.max(seconds, 0));
+	const [hours, minutes, rest] = [
+		Math.floor(whole / 3600),
+		Math.floor(whole / 60) % 60,
+		whole % 60,
+	];
+	const padded = (part: number) => String(part).padStart(2, "0");
+	return `${hours ? `${hours}:${padded(minutes)}` : minutes}:${padded(rest)}`;
+}
+
+// Once it's a tenth of a second or more: not on the frame asked for, nor on a
+// first keyframe after it.
+function backNote(back: number, from: string) {
+	return back >= 0.05 ? `${back.toFixed(1)} s before ${from}` : "";
 }
 
 // startAt finds the keyframe at or before time, or else the Source's first.

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	around,
+	clear,
 	type Frames,
 	type Marks,
 	type Nudge,
@@ -11,7 +12,10 @@ import {
 	press,
 	type Span,
 	seek,
+	setAt,
 	span,
+	typed,
+	typedSpan,
 } from "./marks.ts";
 
 // A movie's frames: keyframes 10.4 s apart, x264's and x265's longest gap, and
@@ -391,6 +395,41 @@ test("Esc clears both marks", () => {
 	assert.deepEqual(marked(everyFrame, ["i", 25.3], ["escape", 26]), noMarks);
 });
 
+test("× clears one edge, keeps the other selected where it was, and stops the loop", () => {
+	const both = marked(movie, ["i", 25.3], ["o", 23]);
+	assert.deepEqual(clear(both, "end"), {
+		start: 20.854,
+		end: undefined,
+		edge: "start",
+		loop: false,
+		note: "4.4 s before you pressed I",
+	});
+	assert.deepEqual(clear(both, "start"), {
+		start: undefined,
+		end: 22.729,
+		edge: "end",
+		loop: false,
+		note: "",
+	});
+	assert.deepEqual(clear(clear(both, "start"), "end"), noMarks);
+	assert.deepEqual(clear(noMarks, "end"), noMarks);
+});
+
+test("With only the end marked, I marks a start before it, as with neither", () => {
+	const onlyEnd = clear(marked(movie, ["i", 25.3], ["o", 23]), "start");
+	assert.deepEqual(press(onlyEnd, "i", 20.854, movie), {
+		start: 20.854,
+		end: 22.729,
+		edge: "start",
+		loop: false,
+		note: "",
+	});
+	assert.deepEqual(
+		press(onlyEnd, "i", 31.5, movie),
+		press(noMarks, "i", 31.5, movie),
+	);
+});
+
 test("The title to prefill is the Source's name and the start, to the second it's in", () => {
 	assert.equal(prefill("Severance S02E07", 754.97), "Severance S02E07 · 12:34");
 	assert.equal(
@@ -400,5 +439,112 @@ test("The title to prefill is the Source's name and the start, to the second it'
 	assert.equal(
 		prefill("Quantum Of Solace (2008)", 3723.5),
 		"Quantum Of Solace (2008) · 1:02:03",
+	);
+});
+
+test("A typed time reads in the clock's own format", () => {
+	const hour = 2 * 3600;
+	assert.equal(typed(noMarks, "start", "1:02:03.45", hour), 3723.45);
+	assert.equal(typed(noMarks, "start", "2:03", hour), 123);
+	assert.equal(typed(noMarks, "start", "123.4", hour), 123.4);
+	assert.equal(typed(noMarks, "end", " 02:03.5 ", hour), 123.5);
+});
+
+test("A typed time that doesn't parse, or is outside the Source, is refused", () => {
+	const unread = "Type a time as 1:02:03.45, 2:03 or 123.4";
+	for (const text of ["", "abc", "1:75", "1::2", "-3", "1:2:3:4", "2:03."])
+		assert.equal(typed(noMarks, "start", text, 600), unread, text);
+	assert.equal(
+		typed(noMarks, "end", "10:00.01", 600),
+		"The Source ends at 10:00",
+	);
+	assert.equal(typed(noMarks, "end", "10:00", 600), 600);
+});
+
+test("A typed start at or after the end, or end at or before the start, is refused", () => {
+	const both = marked(movie, ["i", 25.3], ["o", 23]);
+	assert.equal(
+		typed(both, "start", "22.729", 600),
+		"The start must come before the end",
+	);
+	assert.equal(typed(both, "start", "22.7", 600), 22.7);
+	assert.equal(
+		typed(both, "end", "20.854", 600),
+		"The end must come after the start",
+	);
+	assert.equal(typed(both, "end", "20.9", 600), 20.9);
+});
+
+function typedOver(
+	frames: Frames,
+	marks: Marks,
+	edge: Marks["edge"],
+	time: number,
+) {
+	return setAt(marks, edge, time, listed(frames, typedSpan(time)));
+}
+
+test("A typed start goes on the keyframe at or before it, and the note says how far back", () => {
+	assert.deepEqual(typedOver(movie, noMarks, "start", 25.3), {
+		start: 20.854,
+		end: undefined,
+		edge: "start",
+		loop: false,
+		note: "4.4 s before the time typed",
+	});
+	const both = marked(movie, ["i", 12], ["o", 23]);
+	assert.deepEqual(typedOver(movie, { ...both, edge: "end" }, "start", 20.9), {
+		start: 20.854,
+		end: 22.729,
+		edge: "start",
+		loop: true,
+		note: "",
+	});
+	assert.equal(typedOver(late, noMarks, "start", 3).start, 10);
+});
+
+test("A typed end goes on the clean end at or before it, and loops once both are marked", () => {
+	const start = marked(movie, ["i", 25.3]);
+	assert.deepEqual(typedOver(movie, start, "end", 22.5), {
+		...start,
+		end: 22.354,
+		edge: "end",
+		loop: true,
+	});
+	assert.deepEqual(typedOver(movie, noMarks, "end", 22.5), {
+		...noMarks,
+		end: 22.354,
+		edge: "end",
+	});
+});
+
+test("A typed end with no clean end after the start to go on is refused", () => {
+	const start = marked(movie, ["i", 25.3]);
+	assert.equal(
+		typedOver(movie, start, "end", 20.88),
+		"The end must come after the start",
+	);
+	assert.equal(
+		typedOver(movie, noMarks, "end", 5),
+		"No frame to end on at or before that",
+	);
+});
+
+test("Typing back the time an edge shows, to the hundredth, keeps the edge there", () => {
+	const both = marked(movie, ["i", 25.3], ["o", 23]);
+	assert.deepEqual(typedOver(movie, both, "start", 20.85), {
+		...both,
+		edge: "start",
+		note: "",
+	});
+	assert.deepEqual(typedOver(movie, both, "end", 22.72), both);
+});
+
+test("A typed start landing on the end is refused", () => {
+	const endOnKeyframe = marked(movie, ["o", 20.86]);
+	assert.equal(endOnKeyframe.end, 20.854);
+	assert.equal(
+		typedOver(movie, endOnKeyframe, "start", 20.85),
+		"The start must come before the end",
 	);
 });

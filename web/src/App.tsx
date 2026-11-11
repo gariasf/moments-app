@@ -2,16 +2,19 @@ import { cn } from "cn";
 import { Clapperboard, Plus } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { readAddress, type Screen } from "./address";
 import { MomentMenu } from "./MomentMenu";
 import { getJSON } from "./player";
-import { type Screen, Shell, Toolbar, useShell } from "./Shell";
+import { Shell, Toolbar, useShell } from "./Shell";
 import type { Place } from "./SourceBrowser";
 import { anyOnItsWay, type Save } from "./saves";
 import { formatLength, Trimmer } from "./Trimmer";
 import { useTabTitle } from "./title";
 
 export function App() {
-	const [screen, setScreen] = useState<Screen>("library");
+	const [screen, setScreen] = useState<Screen>(
+		() => readAddress(location.search).screen,
+	);
 	const [place, setPlace] = useState<Place>({ path: "" });
 	return (
 		<Shell
@@ -34,7 +37,8 @@ type Moment = {
 };
 
 function Library() {
-	const { setLibrary, queue, setQueue, toggleQueued, play } = useShell();
+	const { setLibrary, queue, setQueue, toggleQueued, play, missingTitle } =
+		useShell();
 	useTabTitle("Library");
 	const [moments, setMoments] = useState<Moment[]>();
 	const [error, setError] = useState("");
@@ -143,6 +147,15 @@ function Library() {
 				<h1 className="font-heading text-lg">Library</h1>
 				<span className="text-muted-foreground text-sm">Newest first</span>
 			</Toolbar>
+			{missingTitle && (
+				<p
+					role="status"
+					className="mx-4 mt-4 rounded-md bg-muted px-3 py-2 text-sm md:mx-5"
+				>
+					{missingTitle} isn't in the Library. It may have been renamed or
+					deleted in Files.
+				</p>
+			)}
 			{error ? (
 				<p role="alert" className="p-4 text-destructive text-sm">
 					{error}
