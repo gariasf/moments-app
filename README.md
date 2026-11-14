@@ -7,6 +7,17 @@ video in Home, such as a movie or a MeTube download, and keep it as its own
 video in Home/Moments, to replay on loop. Moments reads all of Home and changes
 nothing in it except Downloads/metube and Moments.
 
+![The Library: Moments as tiles, three of them in the Queue](docs/screenshots/library.png)
+
+Mark a stretch of a video in the Trimmer, by key or by typing its times, and
+save it as a Moment:
+
+![The Trimmer: a video with its start and end marked](docs/screenshots/trimmer.png)
+
+Play a Moment on loop, or a Queue of them in order:
+
+![A Queue playing](docs/screenshots/player.png)
+
 ## Install
 
 Moments is in Guillem's Apps, a community app store:
